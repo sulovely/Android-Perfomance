@@ -1,14 +1,13 @@
 """HTML report renderer — full v2 design (Claude Design handoff).
 
-Single self-contained `report.html` that mirrors `report.json`. Layout:
+Single self-contained `report.html` with a focused human-facing view of `report.json`. Layout:
 
     Header   — package + device + run window + verdict pill
     Hero     — verdict bar + 4 event-count cards + derived strip
     01       — Plotly event timeline (7 lanes: 4 events + 3 lifecycle)
     02       — process stability table
     03       — Incidents (filter bar + master/detail)
-    04       — Additional diagnostics: resources · device · collection
-    05       — Appendix: bookmarks · effective config · data files
+    04       — Appendix: bookmarks · effective config · data files
     Footer
 
 All rendering is data-driven: Python embeds the result dict as JSON; the
@@ -577,7 +576,7 @@ _CSS = r"""
   /* ===== INCIDENTS MASTER-DETAIL ===== */
   .md {
     display: grid;
-    grid-template-columns: 380px 1fr;
+    grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
     border: 1px solid var(--rule);
     border-radius: 0 0 6px 6px;
     background: var(--bg);
@@ -639,7 +638,7 @@ _CSS = r"""
   }
   .inc-item .row3 .mono { font-family: "SF Mono", Menlo, monospace; }
 
-  .detail { padding: 30px 34px; min-height: 520px; }
+  .detail { padding: 30px 34px; min-height: 520px; min-width: 0; overflow-wrap: anywhere; }
   .detail[hidden] { display: none; }
   .detail .hd {
     display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
@@ -656,12 +655,13 @@ _CSS = r"""
   .detail .hd .meta {
     font-family: "SF Mono", Menlo, monospace;
     font-size: var(--fs-sm); color: var(--muted);
+    min-width: 0; overflow-wrap: anywhere;
   }
   .detail .hd .spacer { flex: 1; }
 
   .stat-row {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 24px;
     margin-bottom: 30px;
   }
@@ -705,12 +705,15 @@ _CSS = r"""
     font-family: "SF Mono", Menlo, monospace;
     font-size: var(--fs-sm);
     line-height: 1.65;
-    overflow-x: auto;
+    overflow-x: hidden;
     margin-bottom: 18px;
   }
   .frames .f-line {
     display: flex; gap: 12px;
-    white-space: nowrap;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    min-width: 0;
     cursor: pointer;
     padding: 1px 0;
     border-radius: 2px;
@@ -719,12 +722,13 @@ _CSS = r"""
   .frames .f-line:hover { background: rgba(255,255,255,0.06); }
   .frames .f-line.copied { background: rgba(21,128,61,0.25); }
   .frames .f-line .idx { color: #64748b; min-width: 28px; }
+  .frames .f-line > span:last-child { min-width: 0; }
   .frames .f-line.biz { background: rgba(245,158,11,0.14); color: #fde68a; }
   .frames .f-line.biz:hover { background: rgba(245,158,11,0.22); }
   .frames .f-empty { color: #94a3b8; font-style: italic; }
 
   .file-line {
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap;
     padding: 10px 14px;
     background: var(--bg-soft);
     border: 1px solid var(--rule-2);
@@ -743,6 +747,7 @@ _CSS = r"""
     flex-shrink: 0;
   }
   .file-line a { color: var(--accent); text-decoration: none; }
+  .file-line a { min-width: 0; overflow-wrap: anywhere; word-break: break-all; }
   .file-line a:hover { text-decoration: underline; }
   .file-line.warn {
     border-left: 3px solid var(--accent-2);
@@ -890,47 +895,6 @@ _CSS = r"""
     font-size: var(--fs-md);
   }
   .empty-state .emoji { font-size: 40px; display: block; margin-bottom: 14px; }
-
-  .diag-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
-    margin-bottom: 18px;
-  }
-  .diag-card {
-    min-height: 112px;
-    padding: 16px 18px;
-    border: 1px solid var(--rule-2);
-    border-radius: 6px;
-    background: var(--bg-soft);
-  }
-  .diag-card .k {
-    color: var(--muted);
-    font-size: var(--fs-sm);
-    font-weight: 600;
-  }
-  .diag-card .v {
-    margin-top: 5px;
-    color: var(--ink);
-    font-family: "SF Mono", "JetBrains Mono", Menlo, monospace;
-    font-size: var(--fs-xl);
-    font-weight: 700;
-    line-height: 1.25;
-  }
-  .diag-card .v.warn { color: var(--accent-2); }
-  .diag-card .v.bad { color: var(--red); }
-  .diag-card .sub { margin-top: 5px; color: var(--muted); font-size: var(--fs-xs); }
-  .diag-json {
-    max-height: 420px;
-    overflow: auto;
-    margin: 0;
-    padding: 14px;
-    border: 1px solid var(--rule-2);
-    border-radius: 4px;
-    background: var(--bg-soft);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
 
   kbd {
     font-family: "SF Mono", Menlo, monospace;
@@ -1152,25 +1116,11 @@ _BODY_SKELETON = r"""
     </div>
   </section>
 
-  <!-- ADDITIONAL DIAGNOSTICS -->
-  <section id="additional-diagnostics">
-    <div class="sec-head">
-      <h2><span class="zh">其他稳定性诊断</span><span class="en">Additional diagnostics</span></h2>
-      <span class="num-tag">04</span>
-      <span class="desc">
-        <span class="zh">资源风险 · 设备事件 · ExitInfo · 采集健康度 · 自监控</span>
-        <span class="en">resource risks · device events · ExitInfo · collection health · self monitoring</span>
-      </span>
-    </div>
-    <div class="diag-grid" id="diag-cards"></div>
-    <div id="diag-details"></div>
-  </section>
-
   <!-- APPENDIX -->
   <section>
     <div class="sec-head">
       <h2><span class="zh">附加信息</span><span class="en">Appendix</span></h2>
-      <span class="num-tag">05</span>
+      <span class="num-tag">04</span>
       <span class="desc">
         <span class="zh">书签 · 配置 · 数据文件</span>
         <span class="en">bookmarks · effective config · data files</span>
@@ -1515,117 +1465,6 @@ _JS = r"""
       (correlatedTerminations ? ' <span class="v-muted">(+' + correlatedTerminations + ' death)</span>' : '') + '</span></span>' +
       '<span class="d"><span class="lbl">logcat buffers</span><span class="val">' + escapeHtml(buffers) + '</span></span>' +
       failHtml;
-  }
-
-  // ============ ADDITIONAL DIAGNOSTICS ============
-  function renderDiagnostics() {
-    var cards = document.getElementById('diag-cards');
-    var details = document.getElementById('diag-details');
-    if (!cards || !details) return;
-
-    var risks = report.resource_risk || [];
-    var exitInfo = report.exit_info || [];
-    var selfResource = report.self_resource || {};
-    var pipeline = report.event_pipeline || {};
-    var capabilities = report.capabilities || [];
-    var availableCapabilities = capabilities.filter(function (c) {
-      return c.status === 'available';
-    }).length;
-    var pipelineLoss = (pipeline.failed_count || 0) + (pipeline.timed_out_count || 0) +
-      (pipeline.dropped_by_cap_count || 0) + (pipeline.dropped_by_backpressure_count || 0);
-    var exitFailures = exitInfo.filter(function (record) {
-      return record.is_stability_failure === true;
-    }).length;
-    var correlatedExitInfo = exitInfo.filter(function (record) {
-      return !!record.correlated_incident_id;
-    }).length;
-    var coverage = report.coverage_ratio;
-    var coverageText = coverage == null ? '—' : (coverage * 100).toFixed(1) + '%';
-
-    function card(kZh, kEn, value, subZh, subEn, cls) {
-      return '<div class="diag-card"><div class="k"><span class="zh">' + escapeHtml(kZh) +
-        '</span><span class="en">' + escapeHtml(kEn) + '</span></div>' +
-        '<div class="v ' + (cls || '') + '">' + escapeHtml(String(value)) + '</div>' +
-        '<div class="sub"><span class="zh">' + escapeHtml(subZh) + '</span><span class="en">' +
-        escapeHtml(subEn) + '</span></div></div>';
-    }
-    cards.innerHTML =
-      card('采集健康度', 'collection health', report.collection_health || 'unknown',
-        '覆盖率 ' + coverageText, 'coverage ' + coverageText,
-        report.collection_health === 'healthy' ? '' : 'warn') +
-      card('根问题', 'root problems', rootProblemCount,
-        totalIncidents + ' 条观测，' + correlatedTerminations + ' 条关联退出',
-        totalIncidents + ' observations, ' + correlatedTerminations + ' related deaths',
-        rootProblemCount ? 'bad' : '') +
-      card('资源风险', 'resource risks', risks.length,
-        'FD / 线程 / 内存等趋势', 'FD / thread / memory trends', risks.length ? 'warn' : '') +
-      card('设备事件', 'device events', deviceEvents.length,
-        '重启 / 睡眠 / 断连等环境事件', 'reboot / sleep / disconnect context', deviceEvents.length ? 'warn' : '') +
-      card('ExitInfo', 'ExitInfo', exitFailures + ' / ' + exitInfo.length,
-        correlatedExitInfo + ' 条已关联到 incident', correlatedExitInfo + ' correlated to incidents', '') +
-      card('采集管线损失', 'pipeline loss', pipelineLoss,
-        (pipeline.persisted_count || 0) + ' 条已落盘', (pipeline.persisted_count || 0) + ' persisted',
-        pipelineLoss ? 'bad' : '') +
-      card('能力探测', 'capabilities', availableCapabilities + ' / ' + capabilities.length,
-        '设备侧证据源可用', 'device evidence sources available',
-        availableCapabilities < capabilities.length ? 'warn' : '') +
-      card('测试器自监控', 'runner self-monitor', (selfResource.samples || []).length,
-        '峰值 RSS ' + (selfResource.rss_peak_kb == null ? '—' : selfResource.rss_peak_kb + ' KB'),
-        'peak RSS ' + (selfResource.rss_peak_kb == null ? '—' : selfResource.rss_peak_kb + ' KB'), '');
-
-    function jsonBody(value) {
-      return '<pre class="diag-json mono">' + escapeHtml(JSON.stringify(value, null, 2)) + '</pre>';
-    }
-    function accordion(icon, titleZh, titleEn, countText, body) {
-      return '<details class="acc"><summary><span>' + icon + ' <span class="zh">' +
-        escapeHtml(titleZh) + '</span><span class="en">' + escapeHtml(titleEn) + '</span></span>' +
-        '<span class="s-right">' + escapeHtml(countText) + '</span></summary>' +
-        '<div class="body">' + body + '</div></details>';
-    }
-
-    var riskBody = risks.length === 0
-      ? '<div class="v-muted">' + tr('未检测到资源增长风险。', 'No resource-growth risks detected.') + '</div>'
-      : '<div class="table-scroll"><table class="tbl"><thead><tr><th>pid</th><th>metric</th>' +
-        '<th class="r">baseline</th><th class="r">value</th><th>' + tr('摘要', 'summary') +
-        '</th></tr></thead><tbody>' + risks.map(function (risk) {
-          return '<tr><td class="mono">' + escapeHtml(risk.pid) + '</td><td class="mono">' +
-            escapeHtml(risk.metric) + '</td><td class="r mono">' + escapeHtml(risk.baseline) +
-            '</td><td class="r mono">' + escapeHtml(risk.value) + '</td><td>' +
-            escapeHtml(risk.message || '') + '</td></tr>';
-        }).join('') + '</tbody></table></div>';
-
-    var deviceBody = deviceEvents.length === 0
-      ? '<div class="v-muted">' + tr('未记录设备环境事件。', 'No device environment events recorded.') + '</div>'
-      : jsonBody(deviceEvents);
-    var exitBody = exitInfo.length === 0
-      ? '<div class="v-muted">' + tr('无 ApplicationExitInfo 记录。', 'No ApplicationExitInfo records.') + '</div>'
-      : jsonBody(exitInfo);
-    var selfSummary = {
-      sample_count: (selfResource.samples || []).length,
-      rss_growth_kb: selfResource.rss_growth_kb,
-      rss_peak_kb: selfResource.rss_peak_kb,
-      threads_peak: selfResource.threads_peak,
-      fds_peak: selfResource.fds_peak,
-      queue_peak: selfResource.queue_peak,
-    };
-    var collectionDetails = {
-      verdict: report.verdict,
-      verdict_reason: report.verdict_reason || [],
-      verdict_confidence: report.verdict_confidence,
-      event_pipeline: pipeline,
-      collectors: report.collectors || {},
-      capabilities: capabilities,
-      disk_audit: report.disk_audit || [],
-      policy: report.policy || {},
-      recovery_warnings: report.recovery_warnings || [],
-    };
-    details.innerHTML =
-      accordion('⚠', '资源风险', 'Resource risks', String(risks.length), riskBody) +
-      accordion('📱', '设备环境事件', 'Device environment events', String(deviceEvents.length), deviceBody) +
-      accordion('↪', 'ApplicationExitInfo 交叉证据', 'ApplicationExitInfo evidence', String(exitInfo.length), exitBody) +
-      accordion('◉', '测试器自监控', 'Runner self-monitoring', String(selfSummary.sample_count), jsonBody(selfSummary)) +
-      accordion('⌁', '采集器、能力与策略审计', 'Collectors, capabilities & policy audit',
-        availableCapabilities + '/' + capabilities.length, jsonBody(collectionDetails));
   }
 
   // ============ TYPE CHIP COUNTS ============
@@ -2161,8 +2000,8 @@ _JS = r"""
         filesParts.push('<div class="file-line"><span class="k">tombstone</span>' +
           '<a href="incidents/' + escapeAttr(ev.trace_file) + '" target="_blank">incidents/' + escapeHtml(ev.trace_file) + '</a></div>');
       } else if (ev.dropbox_file) {
-        filesParts.push('<div class="file-line warn"><span class="k">ANR trace</span><span>⚠ ' +
-          tr('独立 trace 未拉取；完整线程栈保存在上方 DropBox 文件中。', 'Standalone trace was not pulled; the full thread stack is preserved in the DropBox file above.') +
+        filesParts.push('<div class="file-line warn"><span class="k">tombstone</span><span>⚠ ' +
+          tr('独立 tombstone 未落盘；系统 tombstone 内容仅保存在上方 DropBox 文件中。', 'A standalone tombstone was not persisted; the system tombstone body is only available in the DropBox file above.') +
           '</span></div>');
       } else if (ev.fallback_reason) {
         filesParts.push('<div class="file-line warn"><span class="k">tombstone</span><span>⚠ ' + escapeHtml(ev.fallback_reason) + '</span></div>');
@@ -2306,7 +2145,6 @@ _JS = r"""
         if (window.Plotly) renderTimeline();
         renderFilesTree();
         renderBookmarks();
-        renderDiagnostics();
       });
     });
     paint();
@@ -2558,7 +2396,6 @@ _JS = r"""
     renderVerdictBar();
     renderHeroCards();
     renderDerivedStrip();
-    renderDiagnostics();
     renderTypeChipCounts();
     renderProcessSelect();
     renderProcessTable();
@@ -2614,20 +2451,8 @@ def render(result: Dict) -> str:
         "processes": result.get("processes", []) or [],
         "bookmarks": result.get("bookmarks", []) or [],
         "incident_summary": result.get("incident_summary", {}) or {},
-        "resource_risk": result.get("resource_risk", []) or [],
-        "self_resource": result.get("self_resource", {}) or {},
-        "exit_info": result.get("exit_info", []) or [],
-        "event_pipeline": result.get("event_pipeline", {}) or {},
         "collection_health": result.get("collection_health", "unknown"),
         "coverage_ratio": result.get("coverage_ratio"),
-        "verdict": result.get("verdict"),
-        "verdict_reason": result.get("verdict_reason", []) or [],
-        "verdict_confidence": result.get("verdict_confidence"),
-        "collectors": result.get("collectors", {}) or {},
-        "capabilities": result.get("capabilities", []) or [],
-        "disk_audit": result.get("disk_audit", []) or [],
-        "policy": result.get("policy", {}) or {},
-        "recovery_warnings": result.get("recovery_warnings", []) or [],
     }
     incidents_block = result.get("incidents", []) or []
     issue_groups_block = result.get("issue_groups", []) or []

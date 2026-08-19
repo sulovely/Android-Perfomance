@@ -37,6 +37,23 @@ def _types(report: dict) -> set:
     return {i.get("type") for i in _incidents(report)}
 
 
+def _assert_crash_evidence_bundle(run, incident: dict, *, native: bool = False) -> None:
+    evidence = incident.get("evidence") or {}
+    required = ["logcat_slice_file", "dropbox_file"]
+    if native:
+        required.append("trace_file")
+    for key in required:
+        filename = evidence.get(key)
+        assert filename, f"{incident.get('id')} missing {key}: {evidence}"
+        path = run.output_dir / "incidents" / filename
+        assert path.is_file() and path.stat().st_size > 0, f"missing/empty evidence: {path}"
+    hour = str(incident.get("triggered_at") or "")[:13].replace(" ", "_")
+    hourly_log = run.output_dir / f"logcat_{hour}.log"
+    assert hourly_log.is_file() and hourly_log.stat().st_size > 0, (
+        f"{incident.get('id')} missing hourly logcat: {hourly_log}"
+    )
+
+
 # ── T-L2-001: install + doctor capability report ─────────────────────────────
 
 
@@ -111,6 +128,7 @@ def test_java_main_crash_detected(adb, fault_lab, sat_run):
     # can be evicted when the device reboots mid-suite; the crash must still
     # carry corroborating evidence.)
     evidence = crash.get("evidence") or {}
+    _assert_crash_evidence_bundle(run, crash)
     exit_records = report.get("exit_info") or []
     matching = [e for e in exit_records if e.get("pid") == crash["pid"]]
     sources = evidence.get("supporting_sources") or []
@@ -132,6 +150,7 @@ def test_java_background_crash_detected(adb, fault_lab, sat_run):
     assert report["verdict"] == "unstable"
     crashes = [i for i in _incidents(report) if i["type"] == "java_crash"]
     assert len(crashes) == 1
+    _assert_crash_evidence_bundle(run, crashes[0])
     # Only one occurrence (no double-count via ExitInfo fusion).
     assert len(crashes) == 1
 
@@ -150,6 +169,7 @@ def test_native_sigsegv_detected(adb, fault_lab, sat_run):
     natives = [i for i in _incidents(report) if i["type"] == "native_crash"]
     assert len(natives) == 1, f"expected 1 native_crash: {natives}"
     evidence = natives[0].get("evidence") or {}
+    _assert_crash_evidence_bundle(run, natives[0], native=True)
     assert (evidence.get("signal") or "").upper() == "SIGSEGV"
     # fault addr / pc preserved (IMP-04)
     assert evidence.get("fault_addr") or evidence.get("pc_addresses")
@@ -166,6 +186,7 @@ def test_native_sigabrt_detected_with_abort_message(adb, fault_lab, sat_run):
     natives = [i for i in _incidents(report) if i["type"] == "native_crash"]
     assert len(natives) == 1
     evidence = natives[0].get("evidence") or {}
+    _assert_crash_evidence_bundle(run, natives[0], native=True)
     assert (evidence.get("signal") or "").upper() == "SIGABRT"
     # The fixed abort message is visible in the raw slice.
     slice_text = ""

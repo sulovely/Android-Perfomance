@@ -220,7 +220,24 @@ def test_dropbox_storm_cache_bounds_dumpsys_calls():
             "java_crash", "com.example.app", "2026-08-13 12:00:00.000",
         )
         assert body is not None
-    assert fetcher.dumpsys_calls <= 2, f"dumpsys called {fetcher.dumpsys_calls} times"
+    assert fetcher.dumpsys_calls == 1
+
+    adb.shell.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "Drop box contents: 1 entries\n"
+            "==========================================\n"
+            "2026-08-13 12:00:10 data_app_crash (text, 10 bytes)\n"
+            "Process: com.example.app\n"
+            "java.lang.RuntimeException: newer-boom\n"
+            "==========================================\n"
+        ),
+    )
+    newer = fetcher.fetch(
+        "java_crash", "com.example.app", "2026-08-13 12:00:10.000",
+    )
+    assert any("newer-boom" in line for line in newer)
+    assert fetcher.dumpsys_calls == 2
 
 
 def test_dropbox_cache_expires_after_ttl():

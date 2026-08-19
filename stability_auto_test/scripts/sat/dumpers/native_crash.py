@@ -25,6 +25,32 @@ from . import (
 log = logging.getLogger(__name__)
 
 
+def _recover_tombstone_from_dropbox(
+    dropbox_path: Path,
+    tombstone_path: Path,
+    event: StabilityEvent,
+) -> tuple[bool, str]:
+    """Persist a verified SYSTEM_TOMBSTONE DropBox body as tombstone evidence."""
+    try:
+        body = dropbox_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return False, f"dropbox tombstone unreadable: {exc}"
+    required_markers = ("*** *** ***", "signal ", "backtrace:")
+    if not all(marker in body for marker in required_markers):
+        return False, "dropbox entry is not a complete tombstone"
+    try:
+        tombstone_path.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        return False, f"could not persist dropbox tombstone: {exc}"
+    ok, reason = verify_local_trace(tombstone_path, event)
+    if not ok:
+        try:
+            tombstone_path.unlink()
+        except OSError:
+            pass
+    return ok, reason
+
+
 def run(
     adb: Adb,
     event: StabilityEvent,
@@ -102,6 +128,24 @@ def run(
         fallback = "tombstone pull disabled by config"
 
     dropbox_name = fetch_and_write_dropbox(adb, event, target, base, ctx=ctx, fetcher=fetcher)
+    if pull_tombstone and trace_name is None and dropbox_name:
+        ok, reason = _recover_tombstone_from_dropbox(
+            target / dropbox_name,
+            tombstone_path,
+            event,
+        )
+        match_info["trace_verify_reason"] = reason
+        if ok:
+            trace_name = tombstone_path.name
+            fallback = None
+            match_info["trace_verified"] = True
+            match_info["trace_source"] = "dropbox"
+            match_info["evidence_match_confidence"] = "high"
+            match_info["evidence_match_reasons"] = list(
+                dict.fromkeys(
+                    [*match_info["evidence_match_reasons"], "dropbox_tombstone_body"]
+                )
+            )
     incident = build_incident_dict(
         event,
         logcat_slice_file=slice_name,

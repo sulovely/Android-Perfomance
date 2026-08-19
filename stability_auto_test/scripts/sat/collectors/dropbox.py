@@ -210,10 +210,9 @@ class CachingDropboxFetcher:
 
     A crash storm can request hundreds of DropBox dumps for the same tag;
     each is a full `dumpsys dropbox --print` over the whole history. This
-    wrapper reuses the last result per (event_type, base package) within a
-    TTL, so dumpsys calls stay bounded instead of growing linearly with
-    incident count. Full evidence is still fetched once per TTL window for
-    each distinct fault.
+    wrapper reuses the last result per (event_type, base package, device
+    timestamp) within a TTL. Repeated requests for one fault stay bounded,
+    while a later distinct crash can never receive the previous crash's body.
     """
 
     def __init__(self, adb: Adb, *, ttl_sec: float = 30.0) -> None:
@@ -232,7 +231,7 @@ class CachingDropboxFetcher:
     ) -> Optional[List[str]]:
         import time as _time
 
-        key = (event_type, process.split(":")[0])
+        key = (event_type, process.split(":")[0], device_ts or "")
         now = _time.monotonic()
         cached = self._cache.get(key)
         if cached is not None and now - cached[0] < self._ttl:

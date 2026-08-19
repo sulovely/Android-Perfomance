@@ -46,14 +46,17 @@ def _make_incidents(output_dir: Path):
                 "severity": "fatal",
                 "summary": "boom",
                 "evidence": {
-                    "logcat_slice_file": "java_crash_001.txt",
                     "source": "logcat",
                     "dedup_count": 1,
                     "top_frames": ["at X.y(X.java:1)"],
+                    "sampled": True,
+                    "sample_reason": "occurrence_only",
                 },
             }
         )
     )
+    (inc_dir / "java_crash_001.txt").write_text("java crash logcat slice\n")
+    (inc_dir / "java_crash_001_dropbox.txt").write_text("java crash dropbox body\n")
     (inc_dir / "process_death_002.json").write_text(
         json.dumps(
             {
@@ -101,6 +104,13 @@ def test_build_and_schema_validate(tmp_path: Path):
     death = next(i for i in result["incidents"] if i["type"] == "process_death")
     assert death["evidence"]["secondary_to_incident_id"] == crash["id"]
     assert crash["evidence"]["termination_incident_id"] == death["id"]
+    assert crash["evidence"]["logcat_slice_file"] == "java_crash_001.txt"
+    assert crash["evidence"]["dropbox_file"] == "java_crash_001_dropbox.txt"
+    assert crash["evidence"]["sampled"] is False
+    assert set(crash["evidence"]["recovered_file_references"]) == {
+        "logcat_slice_file",
+        "dropbox_file",
+    }
     assert result["incident_summary"] == {
         "record_count": 2,
         "root_problem_count": 1,

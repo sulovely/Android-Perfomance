@@ -136,8 +136,11 @@ def test_html_render_includes_all_sections(tmp_path: Path):
     assert "Plotly.newPlot" in text
     assert "device-events-data" in text
     assert "设备事件" in text
-    assert 'id="additional-diagnostics"' in text
-    assert "fd_count grew" in text
+    assert 'id="additional-diagnostics"' not in text
+    assert "fd_count grew" not in text
+    assert "grid-template-columns: minmax(280px, 380px) minmax(0, 1fr)" in text
+    assert "white-space: pre-wrap" in text
+    assert "overflow-wrap: anywhere" in text
     assert "secondary_to_incident_id" in text
     assert "ApplicationExitInfo" in text
     assert "defaults are hidden" in text

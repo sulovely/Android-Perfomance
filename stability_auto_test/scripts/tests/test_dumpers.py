@@ -86,6 +86,25 @@ def test_native_crash_falls_back_without_tombstone(tmp_path: Path):
     assert "no_confident_match" in inc["evidence"]["fallback_reason"]
     assert inc["evidence"]["evidence_match_confidence"] == "none"
 
+    fetcher = MagicMock()
+    fetcher.fetch.return_value = [
+        "*** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***",
+        "pid: 1234, tid: 1234, name: main >>> com.example.app <<<",
+        "signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0",
+        "backtrace:",
+        "  #00 pc 00000001 /data/app/libexample.so (crash+1)",
+    ]
+    recovered = native_dumper.run(
+        adb,
+        _event(event_type=EVENT_NATIVE_CRASH),
+        tmp_path / "dropbox-tombstone",
+        fetcher=fetcher,
+    )
+    assert recovered["evidence"]["trace_file"].endswith(".tombstone")
+    assert recovered["evidence"]["trace_source"] == "dropbox"
+    assert recovered["evidence"]["trace_verified"] is True
+    assert recovered["evidence"]["fallback_reason"] is None
+
 
 def test_native_crash_pulls_tombstone_when_available(tmp_path: Path):
     adb = _fake_trace_adb(

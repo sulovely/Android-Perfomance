@@ -215,6 +215,42 @@ def _load_incidents(incidents_dir: Path) -> List[Dict]:
     return out
 
 
+def _restore_evidence_file_references(incidents: List[Dict], incidents_dir: Path) -> None:
+    """Reconcile incident metadata with evidence files already on disk.
+
+    Older occurrence-sampling logic removed references after dumpers had
+    already written the files, leaving valid evidence orphaned and invisible
+    in HTML. The report is the disk inventory, so existing files win.
+    """
+    for incident in incidents:
+        source_file = incident.get("_source_file")
+        if not source_file:
+            continue
+        base = Path(str(source_file)).stem
+        evidence = incident.setdefault("evidence", {})
+        specs = [
+            ("logcat_slice_file", f"{base}.txt"),
+            ("dropbox_file", f"{base}_dropbox.txt"),
+            ("context_file", f"{base}_context.txt"),
+        ]
+        if incident.get("type") == "native_crash":
+            specs.append(("trace_file", f"{base}.tombstone"))
+        elif incident.get("type") == "anr":
+            specs.append(("trace_file", f"{base}.trace"))
+        recovered = []
+        for field, filename in specs:
+            if evidence.get(field):
+                continue
+            if (incidents_dir / filename).is_file():
+                evidence[field] = filename
+                recovered.append(field)
+        if recovered:
+            evidence["recovered_file_references"] = recovered
+            if incident.get("type") in ("java_crash", "native_crash", "anr"):
+                evidence["sampled"] = False
+                evidence["sample_reason"] = "full_evidence_present"
+
+
 def _journal_counts(records: List[Dict]) -> Dict[str, int]:
     """Fold journal records by event_id to produce unique terminal-state counts.
 
@@ -520,6 +556,7 @@ def build(
 
     life_df = _read_csvs(life_files)
     incidents, incident_warnings = _build_incidents(incidents_dir, journal_records)
+    _restore_evidence_file_references(incidents, incidents_dir)
     # DropBox evidence counts as a supporting source for cross-source
     # traceability (spec 4.2: every source that saw the failure is listed).
     for inc in incidents:
