@@ -2,3 +2,6 @@ interface:
   display_name: "Project Test"
   short_description: "Maintain and execute project test suites with AI"
   default_prompt: "Use $project-test to maintain or execute this project test suite."
+
+policy:
+  allow_implicit_invocation: false
