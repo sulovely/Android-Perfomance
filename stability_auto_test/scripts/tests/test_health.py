@@ -58,6 +58,13 @@ def test_fatal_with_healthy_health_is_unstable_high_confidence():
     assert r.confidence == CONFIDENCE_HIGH
 
 
+def test_other_issue_is_an_unstable_outcome():
+    other = {**FATAL, "type": "other", "severity": "error"}
+    r = compute_verdict(HEALTH_HEALTHY, incidents=[other])
+    assert r.verdict == VERDICT_UNSTABLE
+    assert "other x1" in r.reasons[0]
+
+
 # ── T-L0-002: no incidents + low coverage => inconclusive, never stable ──────
 
 
@@ -73,7 +80,7 @@ def test_no_incidents_never_collected_is_inconclusive():
     assert r.verdict == VERDICT_INCONCLUSIVE
 
 
-# ── T-L0-003: only expected exits => stable when coverage complete ───────────
+# ── Legacy process records are ignored by the issue-only verdict ─────────────
 
 
 def test_expected_exits_do_not_fail():
@@ -86,8 +93,8 @@ def test_expected_exits_do_not_fail():
     }
     r = compute_verdict(HEALTH_HEALTHY, incidents=[expected_death])
     assert r.verdict == VERDICT_STABLE
-    assert r.expected_count == 1
-    assert any("audited" in reason for reason in r.reasons)
+    assert r.expected_count == 0
+    assert all("audited" not in reason for reason in r.reasons)
 
 
 def test_explicit_expected_flag_audited_not_failure():
@@ -100,7 +107,7 @@ def test_explicit_expected_flag_audited_not_failure():
     }
     r = compute_verdict(HEALTH_HEALTHY, incidents=[expected_exit])
     assert r.verdict == VERDICT_STABLE
-    assert r.expected_count == 1
+    assert r.expected_count == 0
 
 
 def test_expected_exit_with_degraded_coverage_is_inconclusive():
@@ -175,10 +182,10 @@ def test_junit_fatal_and_gate_failure_are_single_failure():
     assert int(root.attrib["tests"]) == 1
 
 
-# ── unknown abnormal exit blocks stable (spec 4.3) ───────────────────────────
+# ── Legacy process records no longer affect stability verdict ───────────────
 
 
-def test_unknown_process_death_makes_clean_run_inconclusive():
+def test_unknown_process_death_is_ignored():
     unknown = {
         "type": "process_death",
         "process": "com.example.app",
@@ -187,7 +194,7 @@ def test_unknown_process_death_makes_clean_run_inconclusive():
         "evidence": {"reason": "unknown_reason"},
     }
     r = compute_verdict(HEALTH_HEALTHY, incidents=[unknown])
-    assert r.verdict == VERDICT_INCONCLUSIVE
+    assert r.verdict == VERDICT_STABLE
 
 
 # ── regression: healthy + clean => stable, high confidence ───────────────────

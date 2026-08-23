@@ -155,7 +155,7 @@ def _flatten_yaml(data: Dict[str, Any]) -> Dict[str, Any]:
     if "thread_growth_threshold" in resource_risk:
         out["resource_thread_growth_threshold"] = resource_risk["thread_growth_threshold"]
     detection = data.get("detection", {}) or {}
-    for k in ("enable_java_crash", "enable_native_crash", "enable_anr", "enable_process_death"):
+    for k in ("enable_java_crash", "enable_native_crash", "enable_anr"):
         if k in detection:
             out[k] = detection[k]
     if "dedup_window_sec" in detection:
@@ -189,10 +189,7 @@ def _flatten_yaml(data: Dict[str, Any]) -> Dict[str, Any]:
     if "fail_on" in policy:
         out["policy_fail_on"] = list(policy["fail_on"])
     for k in (
-        "max_process_death",
         "max_anr",
-        "max_restarts",
-        "min_uptime_ratio",
         "fail_on_new_regression_only",
     ):
         if k in policy:
@@ -275,8 +272,6 @@ def build_config(args: argparse.Namespace, yaml_path: Optional[Path]) -> Stabili
         "llvm_symbolizer_path": args.llvm_symbolizer,
         "policy_fail_on": _parse_csv_list(args.fail_on),
         "policy_max_anr": args.max_anr,
-        "policy_max_restarts": args.max_restarts,
-        "policy_min_uptime_ratio": args.min_uptime_ratio,
         "device_reboot_policy": args.device_reboot_policy,
         "device_health_interval_sec": args.device_health_interval,
         "resource_risk_interval_sec": args.resource_risk_interval,
@@ -316,8 +311,6 @@ def build_config(args: argparse.Namespace, yaml_path: Optional[Path]) -> Stabili
         cli_map["enable_native_crash"] = False
     if args.no_anr:
         cli_map["enable_anr"] = False
-    if args.no_process_death:
-        cli_map["enable_process_death"] = False
     if args.no_tombstone_pull:
         cli_map["pull_tombstone"] = False
     if args.no_anr_trace_pull:
@@ -495,9 +488,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-native-crash", action="store_true", help="Disable native crash detection")
     p.add_argument("--no-anr", action="store_true", help="Disable ANR detection")
     p.add_argument(
-        "--no-process-death", action="store_true", help="Disable process death detection"
-    )
-    p.add_argument(
         "--dedup-window",
         type=float,
         default=None,
@@ -564,18 +554,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fail-on", default=None, help="Comma-separated event types that fail the gate")
     p.add_argument(
         "--max-anr", type=int, default=None, help="Maximum tolerated ANR count (default: 0)"
-    )
-    p.add_argument(
-        "--max-restarts",
-        type=int,
-        default=None,
-        help="Maximum tolerated process restarts (default: 0)",
-    )
-    p.add_argument(
-        "--min-uptime-ratio",
-        type=float,
-        default=None,
-        help="Minimum per-process uptime ratio (default: 0.99)",
     )
     p.add_argument(
         "--device-reboot-policy",
@@ -1013,9 +991,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     workload_result: Optional[WorkloadResult] = None
     workload_runner: Optional[WorkloadRunner] = None
     workload_thread: Optional[threading.Thread] = None
-    # Unified observation budget (IMP-08): the duration covers preparation +
-    # workload + observation together — a workload never extends the run.
-    deadline = time.time() + effective_duration
+    deadline: Optional[float] = None
     try:
         stab = StabilityTest(cfg)
         if args.workload == "launch" and args.device:
@@ -1026,6 +1002,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             except Exception:
                 log.warning("pre-launch failed; monitor will still wait for process")
         stab.start()
+        # The user duration covers the observable test window.  Preparation,
+        # including the logcat first-line readiness barrier, cannot consume it.
+        deadline = time.time() + effective_duration
         workload = _build_workload(args, stab)
         if workload is not None:
             workload_runner = WorkloadRunner(
@@ -1057,6 +1036,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # suspends time.monotonic() on macOS) does not silently extend the
         # run past the user-specified duration.
         try:
+            assert deadline is not None
             stop_reason = stab.wait(deadline)
             if stop_reason == "fail_fast":
                 log.warning("device fail-fast triggered; stopping")

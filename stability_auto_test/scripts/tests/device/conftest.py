@@ -291,6 +291,7 @@ class SatRun:
             stdout=self.stdout_fh,
             stderr=subprocess.STDOUT,
             text=True,
+            cwd=Path(__file__).parent.parent.parent,
         )
         return self
 

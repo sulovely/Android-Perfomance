@@ -59,6 +59,58 @@ def _scripted_logcat_stream(lines: List[str]):
     return stream
 
 
+def test_logcat_readiness_waits_for_first_line_and_reports_ready(tmp_path: Path):
+    ev_w, life_w = _writers(tmp_path)
+    adb = MagicMock()
+    adb.shell.return_value = MagicMock(returncode=0, stdout="")
+    pool = CollectorPool(
+        adb,
+        PACKAGE,
+        events_writer=ev_w,
+        lifecycle_writer=life_w,
+        rescan_interval_sec=10.0,
+        collectors=CollectorsConfig(logcat_enabled=True),
+        discover_fn=lambda adb, pkg: [],
+        logcat_stream_factory=lambda: _scripted_logcat_stream(
+            ["05-21 10:00:00.000  100  100 I stability_auto_test: collector-ready-probe"]
+        ),
+    )
+    pool.start(initial_processes=[Process(pid=1234, name=PACKAGE)])
+
+    assert pool.wait_for_logcat_ready(1.0) is True
+    assert pool.collector_status()["logcat"]["ready"] is True
+
+    pool.stop(join_timeout=1.0)
+    pool.close()
+    ev_w.close()
+    life_w.close()
+
+
+def test_logcat_readiness_times_out_when_stream_has_no_lines(tmp_path: Path):
+    ev_w, life_w = _writers(tmp_path)
+    adb = MagicMock()
+    adb.shell.return_value = MagicMock(returncode=0, stdout="")
+    pool = CollectorPool(
+        adb,
+        PACKAGE,
+        events_writer=ev_w,
+        lifecycle_writer=life_w,
+        rescan_interval_sec=10.0,
+        collectors=CollectorsConfig(logcat_enabled=True),
+        discover_fn=lambda adb, pkg: [],
+        logcat_stream_factory=lambda: _scripted_logcat_stream([]),
+    )
+    pool.start(initial_processes=[Process(pid=1234, name=PACKAGE)])
+
+    assert pool.wait_for_logcat_ready(0.05) is False
+    assert pool.collector_status()["logcat"]["ready"] is False
+
+    pool.stop(join_timeout=1.0)
+    pool.close()
+    ev_w.close()
+    life_w.close()
+
+
 def test_watcher_emits_lifecycle_rows_only(tmp_path: Path):
     """Watcher reconcile writes new/gone rows but does NOT dispatch events."""
     ev_w, life_w = _writers(tmp_path)
@@ -132,8 +184,8 @@ def test_logcat_pipeline_triggers_java_crash_dumper(tmp_path: Path):
     assert java_dumps[0].exception_class == "java.lang.RuntimeException"
 
 
-def test_logcat_am_proc_died_triggers_process_death_dumper(tmp_path: Path):
-    """am_proc_died in logcat events buffer → process_death event dispatched."""
+def test_logcat_am_proc_died_is_ignored(tmp_path: Path):
+    """Process lifecycle lines do not enter the stability incident pipeline."""
     ev_w, life_w = _writers(tmp_path)
     incidents_dir = tmp_path / "incidents"
 
@@ -158,18 +210,13 @@ def test_logcat_am_proc_died_triggers_process_death_dumper(tmp_path: Path):
     )
     pool.start()
 
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        if pool.event_counts().get(EVENT_PROCESS_DEATH, 0) >= 1:
-            break
-        time.sleep(0.05)
+    time.sleep(0.2)
     pool.stop(join_timeout=1.0)
     ev_w.close()
     life_w.close()
 
-    assert len(death_dumps) == 1
-    assert death_dumps[0].process == PACKAGE
-    assert death_dumps[0].pid == 1234
+    assert death_dumps == []
+    assert pool.event_counts().get(EVENT_PROCESS_DEATH, 0) == 0
 
 
 def test_max_incidents_cap_enforced(tmp_path: Path):

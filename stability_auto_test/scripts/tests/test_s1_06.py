@@ -32,7 +32,6 @@ from sat.collectors.device_health import (
         ({"device_reboot_policy": "bogus"}, "device_reboot_policy"),
         ({"max_queue_size": 0}, "max_queue_size"),
         ({"evidence_sample_every_n": 0}, "evidence_sample_every_n"),
-        ({"policy_min_uptime_ratio": 2.0}, "policy_min_uptime_ratio"),
         ({"policy_fail_on": ["java_crash", "not_a_type"]}, "not_a_type"),
         ({"dump_shutdown_timeout_sec": 0}, "dump_shutdown_timeout_sec"),
         ({"pre_context_sec": -1}, "pre_context_sec"),

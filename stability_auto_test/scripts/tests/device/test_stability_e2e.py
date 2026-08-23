@@ -214,11 +214,13 @@ def test_input_dispatch_anr(adb, fault_lab, sat_run):
     anrs = [i for i in _incidents(report) if i["type"] == "anr"]
     assert 1 <= len(anrs) <= 2, f"expected 1-2 ANR: {report.get('verdict_reason')}"
     evidence = anrs[0].get("evidence") or {}
-    # Degraded trace evidence is acceptable on user builds; the reason text
-    # must reference the input timeout.
-    assert "Input" in (evidence.get("reason") or "") or (
-        evidence.get("fallback_reason") is not None
-    )
+    trace_name = evidence.get("trace_file")
+    assert trace_name, f"ANR trace was not persisted: {evidence}"
+    trace_path = run.output_dir / "incidents" / trace_name
+    assert trace_path.is_file() and trace_path.stat().st_size > 0
+    assert evidence.get("trace_verified") is True
+    assert evidence.get("trace_source") in ("device", "dropbox")
+    assert "Input" in (evidence.get("reason") or "")
     assert report["verdict"] == "unstable"
 
 
@@ -241,7 +243,7 @@ def test_main_deadlock_anr(adb, fault_lab, sat_run):
     assert report["verdict"] == "unstable"
 
 
-# ── T-L2-016: normal self-exit inside an expected action window ──────────────
+# ── T-L2-016: process-only self-exit stays outside issue reporting ───────────
 
 
 def test_self_exit_expected_window(adb, fault_lab, sat_run):
@@ -259,11 +261,10 @@ def test_self_exit_expected_window(adb, fault_lab, sat_run):
     run.wait_exit(timeout=120.0)
     report = run.report()
     deaths = [i for i in _incidents(report) if i["type"] == "process_death"]
-    expected = [d for d in deaths if (d.get("evidence") or {}).get("workload_expected")]
-    assert expected, "in-window self-exit must be marked expected"
+    assert deaths == []
     assert report["verdict"] in ("stable", "inconclusive")
     assert report["verdict"] != "unstable"
-    assert report["expected_exit_count"] >= 1
+    assert report["expected_exit_count"] == 0
 
 
 # ── T-L2-017: external force-stop ────────────────────────────────────────────
@@ -377,12 +378,7 @@ def test_multi_process_faults_do_not_cross_contaminate(adb, fault_lab, sat_run):
     crashes = [i for i in _incidents(report) if i["type"] == "java_crash"]
     assert len(crashes) == 1
     assert crashes[0]["process"] == FAULT_PKG
-    deaths = [i for i in _incidents(report) if i["type"] == "process_death"]
-    remote = [d for d in deaths if ":remote" in d.get("process", "")]
-    # The system may restart a killed FGS; at least one :remote death must be
-    # attributed to the :remote process (never to main).
-    assert remote, "remote process exit must be attributed to :remote"
-    assert all(":remote" in d.get("process", "") for d in remote)
+    assert all(i["type"] != "process_death" for i in _incidents(report))
 
 
 # ── T-L2-033: sensitive canary stays out of the default export ───────────────
@@ -584,24 +580,11 @@ def test_external_sigkill_not_lmk(adb, fault_lab, sat_run):
         trigger_fault(adb, "NATIVE_SELFKILL", wait_begin=False)
     run.wait_exit(timeout=180.0)
     report = run.report()
-    # The kill must be visible as a signaled exit, NEVER as LMK.
-    exit_records = report.get("exit_info") or []
+    # Process-only exits are internal correlation evidence, not report issues.
     deaths = [i for i in _incidents(report) if i["type"] == "process_death"]
-    lmks = [
-        i
-        for i in deaths
-        if "low_memory" in ((i.get("evidence") or {}).get("exit_info_reason") or "")
-    ]
-    assert not lmks, "SIGKILL must not be mislabelled as LMK"
-    assert (
-        any(e.get("exit_reason") == "signaled" for e in exit_records)
-        or any(
-            "signaled" in ((i.get("evidence") or {}).get("exit_info_reason") or "") for i in deaths
-        )
-        or deaths
-    ), f"signaled exit missing: {report.get('verdict_reason')}"
-    # A clean run with an unexplained kill is at least inconclusive.
-    assert report["verdict"] in ("inconclusive", "unstable")
+    assert deaths == []
+    assert report.get("exit_info") == []
+    assert report["verdict"] in ("stable", "inconclusive")
 
 
 # ── S2 L2: crash loop (T-L2-006) ────────────────────────────────────────────

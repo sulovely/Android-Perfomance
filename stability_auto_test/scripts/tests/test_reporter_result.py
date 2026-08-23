@@ -94,16 +94,10 @@ def test_build_and_schema_validate(tmp_path: Path):
         bookmarks=[{"timestamp": "2026-05-21 10:02:00.000", "label": "x"}],
         sample_failures={"logcat": 0, "dropbox": 1},
     )
-    # Process has the java_crash counted
-    proc = next(p for p in result["processes"] if p["name"] == "com.example.app")
-    assert proc["events"]["java_crash"] == 1
-    assert proc["events"]["process_death"] == 1
-    assert proc["restart_count"] == 1
-    assert 0.0 < proc["uptime_ratio"] <= 1.0
+    assert result["processes"] == []
+    assert result["lifecycle_events"] == []
     crash = next(i for i in result["incidents"] if i["type"] == "java_crash")
-    death = next(i for i in result["incidents"] if i["type"] == "process_death")
-    assert death["evidence"]["secondary_to_incident_id"] == crash["id"]
-    assert crash["evidence"]["termination_incident_id"] == death["id"]
+    assert all(i["type"] != "process_death" for i in result["incidents"])
     assert crash["evidence"]["logcat_slice_file"] == "java_crash_001.txt"
     assert crash["evidence"]["dropbox_file"] == "java_crash_001_dropbox.txt"
     assert crash["evidence"]["sampled"] is False
@@ -112,14 +106,14 @@ def test_build_and_schema_validate(tmp_path: Path):
         "dropbox_file",
     }
     assert result["incident_summary"] == {
-        "record_count": 2,
+        "record_count": 1,
         "root_problem_count": 1,
-        "correlated_termination_count": 1,
+        "correlated_termination_count": 0,
         "by_type": {
             "java_crash": 1,
             "native_crash": 0,
             "anr": 0,
-            "process_death": 1,
+            "other": 0,
         },
     }
     assert len(result["issue_groups"]) == 1
@@ -131,8 +125,45 @@ def test_build_and_schema_validate(tmp_path: Path):
     written = result_builder.write(result, tmp_path)
     assert written.exists()
     on_disk = json.loads(written.read_text())
-    assert on_disk["schema_version"] == "1.15"
+    assert on_disk["schema_version"] == "1.17"
     assert on_disk["event_pipeline"]["detected_count"] == 0
+
+
+def test_unknown_stability_issue_is_reported_as_other(tmp_path: Path):
+    incidents_dir = tmp_path / "incidents"
+    incidents_dir.mkdir()
+    (incidents_dir / "watchdog_001.json").write_text(
+        json.dumps(
+            {
+                "type": "watchdog_violation",
+                "process": "com.example.app",
+                "pid": 1234,
+                "triggered_at": "2026-05-21 10:00:00.000",
+                "severity": "error",
+                "summary": "main thread watchdog exceeded",
+                "evidence": {"source": "logcat", "top_frames": ["at X.y(X.java:1)"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    started = datetime(2026, 5, 21, 10, 0, 0, tzinfo=timezone.utc)
+    result = result_builder.build(
+        output_dir=tmp_path,
+        package="com.example.app",
+        started_at=started,
+        ended_at=datetime(2026, 5, 21, 10, 5, 0, tzinfo=timezone.utc),
+        device={"serial": "x"},
+        config_effective={"package": "com.example.app"},
+        exit_code=0,
+        exit_reason="duration_elapsed",
+    )
+
+    assert len(result["incidents"]) == 1
+    assert result["incidents"][0]["type"] == "other"
+    assert result["incidents"][0]["evidence"]["original_type"] == "watchdog_violation"
+    assert result["incident_summary"]["by_type"]["other"] == 1
+    assert result["issue_groups"][0]["type"] == "other"
+    jsonschema.validate(result, json.loads(SCHEMA_PATH.read_text()))
 
 
 def test_journal_failed_evidence_keeps_incident_in_report(tmp_path: Path):

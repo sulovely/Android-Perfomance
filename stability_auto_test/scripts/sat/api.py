@@ -122,7 +122,6 @@ class StabilityConfig:
     enable_java_crash: bool = True
     enable_native_crash: bool = True
     enable_anr: bool = True
-    enable_process_death: bool = True
     dedup_window_sec: float = DEFAULT_DEDUP_WINDOW_SEC
 
     pre_context_sec: float = DEFAULT_PRE_CONTEXT_SEC
@@ -140,12 +139,9 @@ class StabilityConfig:
     llvm_symbolizer_path: Optional[str] = None
     ci_mode: bool = False
     policy_fail_on: List[str] = field(
-        default_factory=lambda: ["java_crash", "native_crash", "anr"],
+        default_factory=lambda: ["java_crash", "native_crash", "anr", "other"],
     )
-    policy_max_process_death: int = 0
     policy_max_anr: int = 0
-    policy_max_restarts: int = 0
-    policy_min_uptime_ratio: float = 0.99
     policy_fail_on_new_regression_only: bool = False
     replay_of_run_id: Optional[str] = None
     pull_tombstone: bool = True
@@ -211,14 +207,10 @@ class StabilityConfig:
                 f"device_reboot_policy must be wait-and-resume|fail-fast, "
                 f"got {self.device_reboot_policy!r}"
             )
-        for name in ("policy_max_process_death", "policy_max_anr", "policy_max_restarts"):
+        for name in ("policy_max_anr",):
             if int(getattr(self, name)) < 0:
                 errors.append(f"{name} must be >= 0, got {getattr(self, name)}")
-        if not 0.0 <= float(self.policy_min_uptime_ratio) <= 1.0:
-            errors.append(
-                f"policy_min_uptime_ratio must be within [0, 1], got {self.policy_min_uptime_ratio}"
-            )
-        valid_types = {"java_crash", "native_crash", "anr", "process_death"}
+        valid_types = {"java_crash", "native_crash", "anr", "other"}
         for fail_type in self.policy_fail_on:
             if fail_type not in valid_types:
                 errors.append(f"policy.fail_on entry {fail_type!r} is not a known event type")
@@ -265,6 +257,7 @@ class StabilityTest:
         self._status: Optional[StatusWriter] = None
         self._live: Optional[LiveServer] = None
         self._started_at: Optional[datetime] = None
+        self._observation_started_at: Optional[datetime] = None
         self._ended_at: Optional[datetime] = None
         # Monotonic counters — only tick while the process actually runs, so
         # `duration_sec` in the report reflects script-active time (not wall
@@ -370,7 +363,6 @@ class StabilityTest:
             enable_java_crash=self.config.enable_java_crash,
             enable_native_crash=self.config.enable_native_crash,
             enable_anr=self.config.enable_anr,
-            enable_process_death=self.config.enable_process_death,
             dedup_window_sec=self.config.dedup_window_sec,
         )
         dumps = DumpsConfig(
@@ -435,9 +427,25 @@ class StabilityTest:
             on_fail_fast=self._fail_fast_event.set,
         )
         self._pool.start(initial_processes=procs)
-        # Observation window begins now — after preflight/wait/proc discovery,
-        # not before (IMP-09: coverage must not include preparation time).
+        # The test window must not begin until logcat has actually yielded its
+        # first line.  This prevents collector startup latency from consuming
+        # the user's duration budget or creating an artificial coverage gap.
+        logcat_ready_timeout = max(1.0, min(float(self.config.wait_timeout_sec), 60.0))
+        if not self._pool.wait_for_logcat_ready(logcat_ready_timeout):
+            msg = f"logcat produced no first line within {logcat_ready_timeout:.1f}s"
+            self._teardown_started_monotonic = time.monotonic()
+            self._pool.stop(join_timeout=1.0, dump_shutdown_timeout_sec=0.0)
+            self._pool.close()
+            for writer in (self._events_writer, self._lifecycle_writer, self._logcat_writer):
+                if writer is not None:
+                    writer.close()
+            self._abort("logcat_not_ready", exit_code=2, msg=msg)
+            raise DeviceSetupError(msg)
+
+        # Observation window begins now — after preflight, process discovery,
+        # and the logcat readiness barrier (IMP-09).
         self._collect_started_monotonic = time.monotonic()
+        self._observation_started_at = datetime.now(timezone.utc)
 
         self._status = StatusWriter(
             self.config.output_dir,
@@ -697,7 +705,11 @@ class StabilityTest:
         result = result_builder.build(
             output_dir=self.config.output_dir,
             package=self.config.package,
-            started_at=self._started_at or datetime.now(timezone.utc),
+            started_at=(
+                self._observation_started_at
+                or self._started_at
+                or datetime.now(timezone.utc)
+            ),
             ended_at=self._ended_at or datetime.now(timezone.utc),
             device=device,
             config_effective=self.config.config_effective(),
@@ -722,10 +734,7 @@ class StabilityTest:
             self_resource=self_resource,
             policy_config={
                 "fail_on": list(self.config.policy_fail_on),
-                "max_process_death": self.config.policy_max_process_death,
                 "max_anr": self.config.policy_max_anr,
-                "max_restarts": self.config.policy_max_restarts,
-                "min_uptime_ratio": self.config.policy_min_uptime_ratio,
                 "min_coverage_ratio": self.config.min_coverage_ratio,
                 "fail_on_new_regression_only": (self.config.policy_fail_on_new_regression_only),
             },
@@ -759,7 +768,7 @@ class StabilityTest:
             fatal = [
                 i
                 for i in result.get("incidents") or []
-                if i.get("type") in ("java_crash", "native_crash", "anr")
+                if i.get("type") in ("java_crash", "native_crash", "anr", "other")
             ]
             if fatal:
                 notifier.notify(

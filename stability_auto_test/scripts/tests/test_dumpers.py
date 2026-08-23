@@ -189,6 +189,41 @@ def test_anr_dumper_pull_failure(tmp_path: Path):
     assert exact_adb.pull.call_args.args[0] == "/data/anr/anr_2026-05-21-10-00-00-000"
 
 
+def test_anr_dumper_recovers_verified_trace_body_from_dropbox(tmp_path: Path):
+    adb = _fake_trace_adb([])
+    adb.pull.side_effect = AdbError("permission denied")
+    fetcher = MagicMock()
+    fetcher.fetch.return_value = [
+        "Process: com.example.app",
+        "PID: 1234",
+        "Data File: /data/anr/anr_2026-05-21-10-00-00-000",
+        "----- dumping pid: 1234 at 1111111",
+        "----- pid 1234 at 2026-05-21 10:00:00 -----",
+        "Cmd line: com.example.app",
+        "DALVIK THREADS (12):",
+        '"main" prio=5 tid=1 Runnable',
+        "  at com.example.app.MainActivity.block(MainActivity.java:42)",
+        "----- end 1234 -----",
+    ]
+
+    recovered = anr_dumper.run(
+        adb,
+        _event(event_type=EVENT_ANR),
+        tmp_path,
+        fetcher=fetcher,
+    )
+
+    evidence = recovered["evidence"]
+    assert evidence["trace_file"].endswith(".trace")
+    assert evidence["trace_source"] == "dropbox"
+    assert evidence["trace_verified"] is True
+    assert evidence["fallback_reason"] is None
+    assert "dropbox_anr_trace_body" in evidence["evidence_match_reasons"]
+    trace = (tmp_path / evidence["trace_file"]).read_text()
+    assert "DALVIK THREADS" in trace
+    assert "com.example.app.MainActivity.block" in trace
+
+
 def test_proc_death_writes_minimal_incident(tmp_path: Path):
     inc = proc_death_dumper.run(
         MagicMock(),

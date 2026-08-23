@@ -38,7 +38,7 @@ ALLOWED_NESTED = {
     },
     "detection": {
         "enable_java_crash", "enable_native_crash", "enable_anr",
-        "enable_process_death", "dedup_window_sec",
+        "dedup_window_sec",
     },
     "dumps": {
         "pre_context_sec", "post_context_sec", "max_incidents_per_type",
@@ -52,8 +52,7 @@ ALLOWED_NESTED = {
         "llvm_symbolizer_path",
     },
     "policy": {
-        "fail_on", "max_process_death", "max_anr", "max_restarts",
-        "min_uptime_ratio", "min_coverage_ratio",
+        "fail_on", "max_anr", "min_coverage_ratio",
         "fail_on_new_regression_only",
     },
     "quota": {
@@ -185,8 +184,7 @@ def validate_config(data: Dict, *, lenient: bool = False) -> List[str]:
     # ── detection ──
     detection = data.get("detection") or {}
     if isinstance(detection, dict):
-        for k in ("enable_java_crash", "enable_native_crash", "enable_anr",
-                  "enable_process_death"):
+        for k in ("enable_java_crash", "enable_native_crash", "enable_anr"):
             if k in detection:
                 check(f"detection.{k}", detection[k], kinds=(bool,))
         if "dedup_window_sec" in detection:
@@ -240,12 +238,9 @@ def validate_config(data: Dict, *, lenient: bool = False) -> List[str]:
             pf = policy["fail_on"]
             if not isinstance(pf, list) or not all(isinstance(x, str) for x in pf):
                 errors.append("policy.fail_on: must be a list of strings")
-        for k in ("max_process_death", "max_anr", "max_restarts"):
+        for k in ("max_anr",):
             if k in policy:
                 check(f"policy.{k}", policy[k], minimum=0, kinds=(int,))
-        if "min_uptime_ratio" in policy:
-            check("policy.min_uptime_ratio", policy["min_uptime_ratio"],
-                  minimum=0.0, maximum=1.0)
         if "min_coverage_ratio" in policy:
             check("policy.min_coverage_ratio", policy["min_coverage_ratio"],
                   minimum=0.0, maximum=1.0)

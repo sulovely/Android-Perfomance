@@ -69,8 +69,8 @@ def test_events_buffer_proc_died_kill_and_anr():
     text = (FIXTURES / "logcat_events_buffer.txt").read_text(encoding="utf-8")
     events = _parse_all(_parser(), text)
     types = [e.event_type for e in events]
-    # am_proc_died + am_kill → process_death (2); am_anr → anr (1)
-    assert types.count(EVENT_PROCESS_DEATH) == 2
+    # Process lifecycle records are ignored; only the ANR is reportable.
+    assert types.count(EVENT_PROCESS_DEATH) == 0
     assert types.count(EVENT_ANR) == 1
     anr = [e for e in events if e.event_type == EVENT_ANR][0]
     assert anr.pid == 1236

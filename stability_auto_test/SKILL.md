@@ -26,7 +26,7 @@ argument-hint: <package> [duration] [--device serial] [--config path] [--output 
 | `--context-buffer-max-lines` / `--context-buffer-max-bytes` | 上下文环形缓冲上限 | 5000 / 4 MiB |
 | `--config-lenient` | 允许未知 YAML 字段 | 关闭 |
 
-> 检测开关（`--no-java-crash` / `--no-native-crash` / `--no-anr` / `--no-process-death`）、dump 拉取开关（`--no-tombstone-pull` / `--no-anr-trace-pull`）等进阶参数均有默认值，可通过 `--config` YAML 覆盖，见 `${CLAUDE_SKILL_DIR}/scripts/config.example.yaml`。
+> 检测开关（`--no-java-crash` / `--no-native-crash` / `--no-anr`）、dump 拉取开关（`--no-tombstone-pull` / `--no-anr-trace-pull`）等进阶参数均有默认值，可通过 `--config` YAML 覆盖，见 `${CLAUDE_SKILL_DIR}/scripts/config.example.yaml`。
 
 **简写识别**：`/stability-auto-test com.example.app 30m` → `--package com.example.app --duration 30m`
 

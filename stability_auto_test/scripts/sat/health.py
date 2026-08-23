@@ -34,12 +34,10 @@ CONFIDENCE_PARTIAL = "partial"
 CONFIDENCE_NONE = "none"
 
 # Incident types that are deterministic failures regardless of coverage.
-FATAL_INCIDENT_TYPES = ("java_crash", "native_crash", "anr")
+FATAL_INCIDENT_TYPES = ("java_crash", "native_crash", "anr", "other")
 
-# Exit reasons that describe *expected* process endings (normal user/system
-# lifecycle, workload-driven exits, self-exit). These never count as failures
-# but are still audited in `verdict_reason`. Matches `policy._normal_recycle`
-# plus the ExitInfo `expected` classification.
+# Legacy exit classification remains available for callers reading older
+# artifacts. Process exits are no longer reportable stability incidents.
 EXPECTED_EXIT_REASON_SUBSTRINGS = (
     "cached",
     "force-stop",
@@ -139,7 +137,7 @@ def compute_verdict(
     1. Any confirmed failure (fatal-type incident that is not expected)
        => `unstable`.  `collection_health` may be degraded/inconclusive at the
        same time; that only lowers `verdict_confidence` to `partial`.
-    2. No failure + unhealthy collection (or an unknown abnormal exit)
+    2. No failure + unhealthy collection
        => `inconclusive`.
     3. No failure + healthy collection => `stable`.
 
@@ -149,7 +147,6 @@ def compute_verdict(
     reasons: List[str] = []
     expected_count = 0
     fatal_incidents: List[Dict] = []
-    unknown_abnormal = 0
 
     for inc in incidents:
         if is_expected_incident(inc):
@@ -158,10 +155,6 @@ def compute_verdict(
         inc_type = inc.get("type")
         if inc_type in fatal_types or inc.get("severity") == "fatal":
             fatal_incidents.append(inc)
-        elif inc_type == "process_death":
-            # Not expected and not fatal: an exit we cannot explain counts as
-            # an unknown abnormal exit (spec 4.3), which blocks "stable".
-            unknown_abnormal += 1
 
     if fatal_incidents:
         counts: Dict[str, int] = {}
@@ -181,24 +174,14 @@ def compute_verdict(
         reasons.append(f"no failure detected, but collection health is {health}")
         confidence = CONFIDENCE_NONE
         verdict = VERDICT_INCONCLUSIVE
-    elif unknown_abnormal:
-        reasons.append(
-            f"no fatal failure detected, but {unknown_abnormal} "
-            "unexpected process exit(s) need explanation"
-        )
-        confidence = CONFIDENCE_NONE
-        verdict = VERDICT_INCONCLUSIVE
     else:
         reasons.append("no failures detected; core collection complete")
         confidence = CONFIDENCE_HIGH
         verdict = VERDICT_STABLE
 
-    if expected_count:
-        reasons.append(f"{expected_count} expected exit(s) audited (not failures)")
-
     return VerdictResult(
         verdict=verdict,
         reasons=reasons,
         confidence=confidence,
-        expected_count=expected_count,
+        expected_count=0,
     )

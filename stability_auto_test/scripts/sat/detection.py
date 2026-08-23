@@ -236,7 +236,7 @@ class LogcatLineParser:
         enable_java_crash: bool = True,
         enable_native_crash: bool = True,
         enable_anr: bool = True,
-        enable_process_death: bool = True,
+        enable_process_death: bool = False,
     ) -> None:
         self.package = package
         self._now_iso = now_iso_fn

@@ -21,15 +21,17 @@ def test_crash_fails_gate_and_lists_rules():
     result = evaluate_policy(incidents, [], 1.0, PolicyConfig())
     assert result["passed"] is False
     assert any(r["rule"] == "fail_on" and r["pass"] is False for r in result["rules"])
-    assert len(result["rules"]) >= 5
+    assert [rule["rule"] for rule in result["rules"]] == [
+        "fail_on",
+        "max_anr",
+        "min_coverage_ratio",
+    ]
 
 
 def test_normal_background_recycle_passes_gate():
     incidents = [_incident("process_death", reason="cached")]
     result = evaluate_policy(incidents, [], 1.0, PolicyConfig())
-    death_rule = next(r for r in result["rules"] if r["rule"] == "max_process_death")
-    assert death_rule["actual"] == 0
-    assert death_rule["pass"] is True
+    assert all(r["rule"] != "max_process_death" for r in result["rules"])
     assert result["passed"] is True
 
 
@@ -38,6 +40,13 @@ def test_low_coverage_fails_gate():
     cov_rule = next(r for r in result["rules"] if r["rule"] == "min_coverage_ratio")
     assert cov_rule["pass"] is False
     assert result["passed"] is False
+
+
+def test_other_issue_fails_default_gate():
+    result = evaluate_policy([_incident("other")], [], 1.0, PolicyConfig())
+    fail_on = next(rule for rule in result["rules"] if rule["rule"] == "fail_on")
+    assert fail_on["actual"]["other"] == 1
+    assert fail_on["pass"] is False
 
 
 def test_multiple_failures_all_listed():
@@ -75,6 +84,5 @@ def test_workload_expected_exit_passes_gate():
     incident = _incident("process_death", reason="am_kill")
     incident["evidence"]["workload_expected"] = True
     result = evaluate_policy([incident], [], 1.0, PolicyConfig())
-    death_rule = next(r for r in result["rules"] if r["rule"] == "max_process_death")
-    assert death_rule["pass"] is True
+    assert all(r["rule"] != "max_process_death" for r in result["rules"])
     assert result["passed"] is True

@@ -41,6 +41,55 @@ def _dropbox_data_file(path: Path) -> Optional[str]:
     return match.group("path") if match else None
 
 
+def _recover_trace_from_dropbox(
+    dropbox_path: Path,
+    trace_path: Path,
+    event: StabilityEvent,
+) -> tuple[bool, str]:
+    """Persist the target process' raw ANR trace embedded in DropBox.
+
+    Android user builds commonly deny direct reads from ``/data/anr``.  The
+    matching ``data_app_anr`` DropBox entry still contains the framework's
+    original VM trace body.  Recover only the section whose PID and command
+    line match this event, then run the same local verifier used for a direct
+    pull.  A metadata-only DropBox entry is never promoted to a trace file.
+    """
+    try:
+        body = dropbox_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return False, f"dropbox_read_failed:{exc}"
+
+    header = re.search(
+        rf"(?m)^----- pid\s+{int(event.pid)}\s+at\b.*$",
+        body,
+    )
+    if header is None:
+        return False, "dropbox_trace_pid_section_missing"
+
+    trace_body = body[header.start() :].strip() + "\n"
+    cmd_match = re.search(r"(?m)^Cmd line:\s*(?P<process>\S+)\s*$", trace_body)
+    if cmd_match is None or cmd_match.group("process") != event.process:
+        return False, "dropbox_trace_process_mismatch"
+    if "DALVIK THREADS" not in trace_body and not re.search(
+        r'(?m)^\s*"main"\s+prio=', trace_body
+    ):
+        return False, "dropbox_trace_body_missing_threads"
+
+    try:
+        trace_path.write_text(trace_body, encoding="utf-8")
+    except OSError as exc:
+        return False, f"dropbox_trace_write_failed:{exc}"
+
+    ok, reason = verify_local_trace(trace_path, event)
+    if not ok:
+        try:
+            trace_path.unlink()
+        except OSError:
+            pass
+        return False, reason
+    return True, reason
+
+
 def _quarantine_unverified(trace_path: Path, target: Path) -> None:
     quarantine = target / f"{trace_path.name}.unverified"
     try:
@@ -112,6 +161,7 @@ def run(
                         fallback = "verification_failed"
                     else:
                         trace_name = trace_path.name
+                        match_info["trace_source"] = "device"
                 else:
                     fallback = "ANR trace pull produced empty file"
             except AdbError as e:
@@ -146,6 +196,7 @@ def run(
                     if ok:
                         trace_name = trace_path.name
                         fallback = None
+                        match_info["trace_source"] = "device"
                         match_info["evidence_match_confidence"] = "high"
                     else:
                         _quarantine_unverified(trace_path, target)
@@ -155,6 +206,33 @@ def run(
                     fallback = "ANR trace referenced by DropBox produced empty file"
             except AdbError as e:
                 fallback = f"ANR trace referenced by DropBox pull failed: {e}"
+        # On production/user builds, `/data/anr` is normally root-only.  The
+        # DropBox body can still carry the complete framework VM trace.  Save
+        # that exact, PID/process-verified body as the standalone trace rather
+        # than leaving the report with metadata only.
+        if trace_name is None:
+            ok, reason = _recover_trace_from_dropbox(
+                target / dropbox_name,
+                trace_path,
+                event,
+            )
+            match_info["trace_verify_reason"] = reason
+            if ok:
+                trace_name = trace_path.name
+                fallback = None
+                match_info["trace_verified"] = True
+                match_info["trace_source"] = "dropbox"
+                match_info["evidence_match_confidence"] = "high"
+                match_info["evidence_match_reasons"] = list(
+                    dict.fromkeys(
+                        [
+                            *match_info["evidence_match_reasons"],
+                            "dropbox_anr_trace_body",
+                            "pid_match",
+                            "process_match",
+                        ]
+                    )
+                )
     incident = build_incident_dict(
         event,
         logcat_slice_file=slice_name,

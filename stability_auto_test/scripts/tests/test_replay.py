@@ -81,6 +81,10 @@ def test_run_replay_records_replay_of_run_id(tmp_path: Path, monkeypatch):
                         lambda adb, pkg, *, timeout_sec: [Process(pid=1234, name=pkg)])
 
     cfg = _cfg(tmp_path)
+    # This unit test verifies replay provenance only and uses a MagicMock ADB;
+    # do not start a real logcat subprocess. Device replay coverage is tested
+    # separately by the device suites.
+    cfg.logcat_enabled = False
     write_replay_manifest(
         cfg, workload_manifest=None,
         output_dir=tmp_path, run_id="run-orig",

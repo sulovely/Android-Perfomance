@@ -51,8 +51,7 @@ def _affected_devices(group: Dict) -> List[str]:
 
 def _severity(group: Dict) -> int:
     sev = group.get("type", "")
-    return {"java_crash": 3, "native_crash": 3, "anr": 2,
-            "process_death": 1}.get(sev, 0)
+    return {"java_crash": 3, "native_crash": 3, "anr": 2, "other": 2}.get(sev, 0)
 
 
 def compare_reports(baseline: Dict, current: Dict) -> Dict:

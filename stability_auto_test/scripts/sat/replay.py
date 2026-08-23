@@ -39,6 +39,7 @@ def write_replay_manifest(
             "dedup_window_sec": config.dedup_window_sec,
             "pre_context_sec": config.pre_context_sec,
             "post_context_sec": config.post_context_sec,
+            "logcat_enabled": config.logcat_enabled,
             "logcat_buffers": list(config.logcat_buffers),
             "min_coverage_ratio": config.min_coverage_ratio,
             "policy_fail_on": list(config.policy_fail_on),
@@ -68,9 +69,10 @@ def config_from_manifest(data: Dict, output_dir: Path) -> StabilityConfig:
         dedup_window_sec=float(cfg_data.get("dedup_window_sec", 5.0)),
         pre_context_sec=float(cfg_data.get("pre_context_sec", 30.0)),
         post_context_sec=float(cfg_data.get("post_context_sec", 10.0)),
+        logcat_enabled=bool(cfg_data.get("logcat_enabled", True)),
         logcat_buffers=list(cfg_data.get("logcat_buffers", ["main", "system", "events", "crash"])),
         min_coverage_ratio=float(cfg_data.get("min_coverage_ratio", 0.99)),
-        policy_fail_on=list(cfg_data.get("policy_fail_on", ["java_crash", "native_crash", "anr"])),
+        policy_fail_on=list(cfg_data.get("policy_fail_on", ["java_crash", "native_crash", "anr", "other"])),
         replay_of_run_id=data.get("original_run_id"),
     )
 

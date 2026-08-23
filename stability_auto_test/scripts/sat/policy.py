@@ -16,23 +16,22 @@ from .health import is_expected_incident
 @dataclass
 class PolicyConfig:
     fail_on: List[str] = field(
-        default_factory=lambda: ["java_crash", "native_crash", "anr"],
+        default_factory=lambda: ["java_crash", "native_crash", "anr", "other"],
     )
-    max_process_death: int = 0
     max_anr: int = 0
-    max_restarts: int = 0
-    min_uptime_ratio: float = 0.99
     min_coverage_ratio: float = 0.99
     fail_on_new_regression_only: bool = False
 
 
 def policy_from_dict(data: Dict) -> PolicyConfig:
+    fail_on = [
+        value
+        for value in data.get("fail_on", ["java_crash", "native_crash", "anr", "other"])
+        if value in ("java_crash", "native_crash", "anr", "other")
+    ]
     return PolicyConfig(
-        fail_on=list(data.get("fail_on", ["java_crash", "native_crash", "anr"])),
-        max_process_death=int(data.get("max_process_death", 0)),
+        fail_on=fail_on,
         max_anr=int(data.get("max_anr", 0)),
-        max_restarts=int(data.get("max_restarts", 0)),
-        min_uptime_ratio=float(data.get("min_uptime_ratio", 0.99)),
         min_coverage_ratio=float(data.get("min_coverage_ratio", 0.99)),
         fail_on_new_regression_only=bool(data.get("fail_on_new_regression_only", False)),
     )
@@ -68,41 +67,6 @@ def evaluate_policy(
             "actual": anr_count,
             "threshold": policy.max_anr,
             "pass": anr_count <= policy.max_anr,
-        }
-    )
-
-    death_count = sum(
-        1 for i in incidents if i.get("type") == "process_death" and not is_expected_incident(i)
-    )
-    rules.append(
-        {
-            "rule": "max_process_death",
-            "actual": death_count,
-            "threshold": policy.max_process_death,
-            "pass": death_count <= policy.max_process_death,
-        }
-    )
-
-    restart_count = sum(p.get("restart_count", 0) for p in processes)
-    rules.append(
-        {
-            "rule": "max_restarts",
-            "actual": restart_count,
-            "threshold": policy.max_restarts,
-            "pass": restart_count <= policy.max_restarts,
-        }
-    )
-
-    uptime = min(
-        (p.get("uptime_ratio", 1.0) for p in processes),
-        default=1.0,
-    )
-    rules.append(
-        {
-            "rule": "min_uptime_ratio",
-            "actual": round(uptime, 4),
-            "threshold": policy.min_uptime_ratio,
-            "pass": uptime >= policy.min_uptime_ratio,
         }
     )
 

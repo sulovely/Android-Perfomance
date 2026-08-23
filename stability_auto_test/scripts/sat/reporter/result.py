@@ -1,8 +1,8 @@
 """Build the canonical structured report (`report.json`).
 
-Reads from the run's output directory (events.csv + lifecycle.csv + incidents/
-*.json files) and returns the result dict that all other report formats
-render from. This is the single source of truth for AI / CI consumers.
+Reads issue evidence from the run's output directory and returns the result
+dict that all other report formats render from. Process lifecycle artifacts
+may still exist for runtime orchestration, but are excluded from reporting.
 """
 
 from __future__ import annotations
@@ -11,15 +11,12 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-import pandas as pd
+from typing import Any, Dict, List, Optional
 
 from ..analyzers.exit_correlation import correlate_exit_info
-from ..analyzers.fingerprint import group_incidents
+from ..analyzers.fingerprint import ISSUE_EVENT_TYPES, group_incidents
 from ..atomic_io import atomic_write_json
 from ..collectors.resource_risk import correlate_resource_risk
-from ..detection import ALL_EVENT_TYPES
 from ..health import compute_verdict
 from ..journal import (
     JOURNAL_FILENAME,
@@ -35,9 +32,8 @@ from ..policy import evaluate_policy, policy_from_dict
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.15"
+SCHEMA_VERSION = "1.17"
 REPORT_FILENAME = "report.json"
-CRASH_TERMINATION_WINDOW_SEC = 30.0
 
 
 def _iso(ts: Optional[datetime]) -> Optional[str]:
@@ -46,153 +42,6 @@ def _iso(ts: Optional[datetime]) -> Optional[str]:
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return ts.isoformat(timespec="milliseconds").replace("T", " ").replace("+00:00", "")
-
-
-def _read_csvs(paths: List[Path]) -> pd.DataFrame:
-    dfs = []
-    for p in paths:
-        try:
-            df = pd.read_csv(p, comment="#")
-        except (pd.errors.EmptyDataError, FileNotFoundError):
-            continue
-        except pd.errors.ParserError as e:
-            log.warning("could not parse %s: %s", p, e)
-            continue
-        if df.empty:
-            continue
-        dfs.append(df)
-    if not dfs:
-        return pd.DataFrame()
-    return pd.concat(dfs, ignore_index=True)
-
-
-def _alive_intervals(
-    proc_life: pd.DataFrame,
-    run_start: datetime,
-    run_end: datetime,
-) -> Tuple[Optional[datetime], Optional[datetime], List[Tuple[datetime, datetime]]]:
-    if proc_life.empty:
-        return None, None, []
-    df = proc_life.copy()
-    df["_ts"] = pd.to_datetime(df["timestamp"], utc=True)
-    df = df.sort_values("_ts")
-
-    first_seen: Optional[datetime] = None
-    last_seen: Optional[datetime] = None
-    intervals: List[Tuple[datetime, datetime]] = []
-    alive_start: Optional[datetime] = None
-
-    for _, row in df.iterrows():
-        ts = row["_ts"].to_pydatetime()
-        event = row["event"]
-        if event in ("new", "restart"):
-            if first_seen is None:
-                first_seen = ts
-            if alive_start is None:
-                alive_start = ts
-        elif event == "gone":
-            if alive_start is not None:
-                intervals.append((alive_start, ts))
-                last_seen = ts
-                alive_start = None
-
-    if alive_start is not None:
-        intervals.append((alive_start, run_end))
-        last_seen = run_end if last_seen is None else max(last_seen, run_end)
-
-    return first_seen, last_seen, intervals
-
-
-def _event_counts_for(incidents: List[Dict], process_name: str) -> Dict[str, int]:
-    counts = {t: 0 for t in ALL_EVENT_TYPES}
-    for i in incidents:
-        if i.get("process") != process_name:
-            continue
-        t = i.get("type")
-        if t in counts:
-            counts[t] += 1
-    return counts
-
-
-def _timestamp_epoch(value: Optional[str]) -> Optional[float]:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
-
-
-def _correlate_crash_terminations(
-    incidents: List[Dict],
-    *,
-    window_sec: float = CRASH_TERMINATION_WINDOW_SEC,
-) -> Dict[str, Any]:
-    """Link a crash to the process-death observation it caused.
-
-    A Java/native crash and the watcher's subsequent PID disappearance are
-    two useful observations of one root failure. Keep both records for audit
-    and lifecycle analysis, but mark the death as secondary so consumers do
-    not have to count the same root problem twice.
-    """
-    crashes = [inc for inc in incidents if inc.get("type") in ("java_crash", "native_crash")]
-    correlated = 0
-    used_crash_ids = set()
-    for death in incidents:
-        if death.get("type") != "process_death":
-            continue
-        death_evidence = death.setdefault("evidence", {})
-        if death_evidence.get("workload_expected") or death_evidence.get("expected"):
-            continue
-        death_ts = _timestamp_epoch(death.get("triggered_at"))
-        if death_ts is None:
-            continue
-        candidates = []
-        for crash in crashes:
-            if crash.get("id") in used_crash_ids:
-                continue
-            if crash.get("process") != death.get("process"):
-                continue
-            if not crash.get("pid") or crash.get("pid") != death.get("pid"):
-                continue
-            crash_ts = _timestamp_epoch(crash.get("triggered_at"))
-            if crash_ts is None:
-                continue
-            delta = death_ts - crash_ts
-            if 0.0 <= delta <= window_sec:
-                candidates.append((delta, crash))
-        if not candidates:
-            continue
-        delta, crash = min(candidates, key=lambda item: item[0])
-        crash_evidence = crash.setdefault("evidence", {})
-        death_evidence["secondary_to_incident_id"] = crash.get("id")
-        death_evidence["secondary_to_event_id"] = crash.get("event_id")
-        death_evidence["root_cause_type"] = crash.get("type")
-        death_evidence["root_cause_delay_sec"] = round(delta, 3)
-        crash_evidence["termination_incident_id"] = death.get("id")
-        crash_evidence["termination_event_id"] = death.get("event_id")
-        crash_evidence["termination_delay_sec"] = round(delta, 3)
-        used_crash_ids.add(crash.get("id"))
-        correlated += 1
-
-    by_type = {event_type: 0 for event_type in ALL_EVENT_TYPES}
-    for incident in incidents:
-        event_type = incident.get("type")
-        if event_type in by_type:
-            by_type[event_type] += 1
-    return {
-        "record_count": len(incidents),
-        "root_problem_count": sum(
-            1
-            for incident in incidents
-            if not (incident.get("evidence") or {}).get("secondary_to_incident_id")
-        ),
-        "correlated_termination_count": correlated,
-        "by_type": by_type,
-    }
 
 
 def _load_incidents(incidents_dir: Path) -> List[Dict]:
@@ -313,6 +162,41 @@ def _journal_counts(records: List[Dict]) -> Dict[str, int]:
         "dropped_by_cap_count": dropped,
         "dropped_by_backpressure_count": dropped_bp,
     }
+
+
+def _issue_journal_records(records: List[Dict]) -> List[Dict]:
+    """Keep pipeline accounting scoped to reportable stability issues."""
+    issue_event_ids = {
+        rec.get("event_id")
+        for rec in records
+        if rec.get("event_type") != "process_death" and rec.get("event_type") and rec.get("event_id")
+    }
+    return [rec for rec in records if rec.get("event_id") in issue_event_ids]
+
+
+def _normalize_reportable_issue(incident: Dict) -> Optional[Dict]:
+    incident_type = incident.get("type")
+    if incident_type == "process_death":
+        return None
+    normalized = dict(incident)
+    normalized["evidence"] = dict(incident.get("evidence") or {})
+    if incident_type not in ISSUE_EVENT_TYPES:
+        normalized["type"] = "other"
+        normalized["evidence"]["original_type"] = str(incident_type or "unknown")
+    evidence = incident.get("evidence") or {}
+    if evidence.get("source") != "exit_info":
+        return normalized
+    # A generic ExitInfo "crashed" record does not prove Java/native root
+    # cause. Keep confirmed ANRs and crash records that have a signature.
+    if incident.get("type") == "anr":
+        return normalized
+    if not (
+        evidence.get("exception_class")
+        or evidence.get("signal")
+        or evidence.get("top_frames")
+    ):
+        return None
+    return normalized
 
 
 def _placeholder_incident(
@@ -447,55 +331,6 @@ def _build_incidents(
     return incidents, warnings
 
 
-def _build_process(
-    name: str,
-    life_df: pd.DataFrame,
-    run_start: datetime,
-    run_end: datetime,
-    incidents: List[Dict],
-    sample_failures: Dict[str, int],
-) -> Dict:
-    proc_life = (
-        life_df[life_df["process_name"] == name]
-        if not life_df.empty and "process_name" in life_df.columns
-        else pd.DataFrame()
-    )
-
-    first_seen, last_seen, intervals = _alive_intervals(proc_life, run_start, run_end)
-    alive_sec = sum((end - start).total_seconds() for start, end in intervals)
-    total_sec = max(1e-9, (run_end - run_start).total_seconds())
-    uptime_ratio = min(1.0, alive_sec / total_sec) if alive_sec > 0 else 0.0
-    restart_count = int((proc_life["event"] == "restart").sum()) if not proc_life.empty else 0
-
-    return {
-        "name": name,
-        "first_seen_at": _iso(first_seen),
-        "last_seen_at": _iso(last_seen),
-        "uptime_ratio": round(uptime_ratio, 4),
-        "restart_count": restart_count,
-        "events": _event_counts_for(incidents, name),
-        "sample_failures": dict(sample_failures),
-    }
-
-
-def _build_lifecycle_events(life_df: pd.DataFrame) -> List[Dict]:
-    if life_df.empty:
-        return []
-    out: List[Dict] = []
-    for _, row in life_df.iterrows():
-        out.append(
-            {
-                "timestamp": row["timestamp"],
-                "process": row["process_name"],
-                "event": row["event"],
-                "old_pid": int(row["old_pid"]) if pd.notna(row.get("old_pid")) else 0,
-                "new_pid": int(row["new_pid"]) if pd.notna(row.get("new_pid")) else 0,
-                "gap_sec": float(row["gap_sec"]) if pd.notna(row.get("gap_sec")) else 0.0,
-            }
-        )
-    return out
-
-
 def build(
     *,
     output_dir: Path,
@@ -537,7 +372,6 @@ def build(
     """
     output_dir = Path(output_dir)
     incidents_dir = output_dir / "incidents"
-    sample_failures = sample_failures or {}
     event_pipeline = {
         "detected_count": 0,
         "persisted_count": 0,
@@ -549,13 +383,21 @@ def build(
     }
 
     events_files = sorted(output_dir.glob("events_*.csv"))
-    life_files = sorted(output_dir.glob("lifecycle_*.csv"))
     logcat_files = sorted(output_dir.glob("logcat_*.log"))
     journal_path = output_dir / JOURNAL_FILENAME
     journal_records, recovery_warnings = read_journal(journal_path)
 
-    life_df = _read_csvs(life_files)
-    incidents, incident_warnings = _build_incidents(incidents_dir, journal_records)
+    issue_journal = _issue_journal_records(journal_records)
+    incidents, incident_warnings = _build_incidents(incidents_dir, issue_journal)
+    # Historical runs may contain process-death JSON files. They remain on disk
+    # as raw collector evidence but are no longer part of the canonical report.
+    incidents = [
+        normalized
+        for incident in incidents
+        if (normalized := _normalize_reportable_issue(incident)) is not None
+    ]
+    for index, incident in enumerate(incidents, start=1):
+        incident["id"] = f"incident-{index:03d}"
     _restore_evidence_file_references(incidents, incidents_dir)
     # DropBox evidence counts as a supporting source for cross-source
     # traceability (spec 4.2: every source that saw the failure is listed).
@@ -566,12 +408,25 @@ def build(
             sources.append("dropbox")
         if sources:
             evidence["supporting_sources"] = sources
-    exit_records = correlate_exit_info(incidents, list(exit_info or []))
+    # ExitInfo is useful internally for strengthening crash/ANR evidence, but
+    # process exit records are intentionally not exposed as a report statistic.
+    correlate_exit_info(incidents, list(exit_info or []))
     correlate_resource_risk(incidents, list(resource_risk or []))
-    incident_summary = _correlate_crash_terminations(incidents)
+    issue_groups = group_incidents(incidents)
+    by_type = {event_type: 0 for event_type in ISSUE_EVENT_TYPES}
+    for group in issue_groups:
+        event_type = group.get("type")
+        if event_type in by_type:
+            by_type[event_type] += int(group.get("occurrence_count", 0))
+    incident_summary = {
+        "record_count": sum(by_type.values()),
+        "root_problem_count": len(issue_groups),
+        "correlated_termination_count": 0,
+        "by_type": by_type,
+    }
     recovery_warnings = recovery_warnings + incident_warnings
-    if journal_records:
-        event_pipeline = _journal_counts(journal_records)
+    if issue_journal:
+        event_pipeline = _journal_counts(issue_journal)
     collector_health = collector_health or {
         "health": "healthy",
         "coverage_ratio": 1.0,
@@ -587,17 +442,7 @@ def build(
     verdict_result = compute_verdict(collection_health, incidents=incidents)
     verdict = verdict_result.verdict
 
-    process_names = set()
-    if not life_df.empty and "process_name" in life_df.columns:
-        process_names.update(life_df["process_name"].dropna().unique())
-    for inc in incidents:
-        if inc.get("process"):
-            process_names.add(inc["process"])
-
-    processes = [
-        _build_process(name, life_df, started_at, ended_at, incidents, sample_failures)
-        for name in sorted(process_names)
-    ]
+    processes: List[Dict] = []
 
     policy = policy_from_dict(policy_config or {})
     policy_result = evaluate_policy(
@@ -637,34 +482,29 @@ def build(
         "processes": processes,
         "incidents": incidents,
         "incident_summary": incident_summary,
-        "issue_groups": group_incidents(
-            [
-                incident
-                for incident in incidents
-                if not (incident.get("evidence") or {}).get("secondary_to_incident_id")
-            ]
-        ),
-        "exit_info": exit_records,
+        "issue_groups": issue_groups,
+        "exit_info": [],
         "device_events": list(device_events or []),
         "resource_risk": list(resource_risk or []),
         "self_resource": self_resource or {},
         "event_pipeline": event_pipeline,
         "collection_health": collection_health,
+        "collection_health_reasons": health_reasons,
         "coverage_ratio": coverage_ratio,
         "verdict": verdict,
         "verdict_reason": list(verdict_result.reasons),
         "verdict_confidence": verdict_result.confidence,
-        "expected_exit_count": verdict_result.expected_count,
+        "expected_exit_count": 0,
         "collectors": collectors or {},
         "capabilities": list(capabilities or []),
         "disk_audit": list(quota_audit or []),
         "policy": policy_result,
         "recovery_warnings": recovery_warnings,
-        "lifecycle_events": _build_lifecycle_events(life_df),
+        "lifecycle_events": [],
         "bookmarks": list(bookmarks or []),
         "data_files": {
             "events": [p.name for p in events_files],
-            "lifecycle": [p.name for p in life_files],
+            "lifecycle": [],
             "logcat": [p.name for p in logcat_files],
             "journal": [journal_path.name] if journal_path.exists() else [],
         },

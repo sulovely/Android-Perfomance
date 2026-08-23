@@ -350,7 +350,6 @@ def build_report() -> dict:
                 "enable_java_crash": True,
                 "enable_native_crash": True,
                 "enable_anr": True,
-                "enable_process_death": True,
                 "dedup_window_sec": 5.0,
                 "pre_context_sec": 30.0,
                 "post_context_sec": 10.0,

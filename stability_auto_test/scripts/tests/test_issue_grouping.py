@@ -56,7 +56,8 @@ def test_report_contains_issue_groups(tmp_path: Path):
 
     path = html_renderer.write(result, tmp_path)
     text = path.read_text(encoding="utf-8")
-    assert "issue-groups" in text
-    assert "<details>" in text
-    assert "10" in text
+    assert 'id="issue-groups"' not in text
+    assert 'id="occurrences-data"' in text
+    assert '"issue_id": "issue-001"' in text
+    assert '"occurrence_count": 10' in text
     assert "incident-010" in text

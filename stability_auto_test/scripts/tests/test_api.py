@@ -55,7 +55,7 @@ def test_context_manager_writes_report(tmp_path: Path, monkeypatch):
         t.bookmark("scenario_a_done")
 
     report = json.loads((tmp_path / "out" / "report.json").read_text())
-    assert report["schema_version"] == "1.15"
+    assert report["schema_version"] == "1.17"
     assert report["run"]["package"] == "com.example.app"
     assert report["run"]["exit_code"] == 0
     assert any(b["label"] == "scenario_a_done" for b in report["bookmarks"])

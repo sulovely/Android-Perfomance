@@ -116,6 +116,19 @@ def test_html_render_includes_all_sections(tmp_path: Path):
                     "root_cause_type": "java_crash",
                 },
             },
+            {
+                "id": "incident-003",
+                "type": "watchdog_violation",
+                "process": "com.example.app",
+                "pid": 1234,
+                "triggered_at": "2026-05-21 10:01:02.000",
+                "severity": "error",
+                "summary": "watchdog timeout",
+                "evidence": {
+                    "source": "logcat",
+                    "top_frames": ["at X.watch(X.java:2)"],
+                },
+            },
         ],
         "lifecycle_events": [],
         "bookmarks": [{"timestamp": "2026-05-21 10:02:00.000", "label": "b"}],
@@ -126,9 +139,8 @@ def test_html_render_includes_all_sections(tmp_path: Path):
         "package": "com.example.app",
         "device": "x",
         "output_dir": "/tmp/report",
-        "pre_context_sec": 45.0,
     }
-    assert compact["hidden_count"] == 3
+    assert compact["hidden_count"] == 0
     written = html.write(result, tmp_path)
     text = written.read_text()
     assert "Stability report" in text
@@ -141,10 +153,27 @@ def test_html_render_includes_all_sections(tmp_path: Path):
     assert "grid-template-columns: minmax(280px, 380px) minmax(0, 1fr)" in text
     assert "white-space: pre-wrap" in text
     assert "overflow-wrap: anywhere" in text
-    assert "secondary_to_incident_id" in text
+    assert 'data-card-type="process_death"' not in text
+    assert 'data-card-type="other"' in text
+    assert 'data-type="other"' in text
+    assert 'id="other-help"' in text
+    assert '"type": "other"' in text
+    assert '"original_type": "watchdog_violation"' in text
+    assert "Cluster confidence" in text
+    assert "customdata: targetIds" in text
+    assert "ev.points[0].customdata || ev.points[0].id" in text
+    assert 'id="issue-groups"' not in text
+    assert 'id="proc-tbody"' not in text
+    assert '"issue_id": "issue-001"' in text
     assert "ApplicationExitInfo" in text
-    assert "defaults are hidden" in text
-    assert '"hidden_count": 3' in text
+    assert "HTML shows only package, device and output_dir" in text
+    assert '"hidden_count": 0' in text
+    assert ".guidance .action { display: block" in text
+    assert "bookmarkLaneEnds" in text
+    assert "item.lane * 0.10" in text
+    assert "Click any frame below to copy" in text
+    assert "document.execCommand('copy')" in text
+    assert "copy-state" in text
     # Counters block + incident details rendered
     assert "Java crash" in text
     assert "boom" in text

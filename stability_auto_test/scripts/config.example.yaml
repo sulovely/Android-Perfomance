@@ -21,8 +21,7 @@ detection:
   enable_java_crash: true
   enable_native_crash: true
   enable_anr: true
-  enable_process_death: true
-  dedup_window_sec: 5         # 主机时间兜底窗口（仅用于无 device_ts 的 watcher 事件）
+  dedup_window_sec: 5         # 同一问题的设备时间去重窗口
   # device_ts_window_sec: 10 # 设备时间主窗口（内部默认 10s；logcat 与 dropbox 跨源去重依赖此值）
 
 dumps:
@@ -46,11 +45,8 @@ diagnosis:
   llvm_symbolizer_path: null         # llvm-symbolizer 路径
 
 policy:
-  fail_on: [java_crash, native_crash, anr]
-  max_process_death: 0
+  fail_on: [java_crash, native_crash, anr, other]
   max_anr: 0
-  max_restarts: 0
-  min_uptime_ratio: 0.99
   min_coverage_ratio: 0.99
   fail_on_new_regression_only: false
 

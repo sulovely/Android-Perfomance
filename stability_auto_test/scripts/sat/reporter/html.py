@@ -3,11 +3,10 @@
 Single self-contained `report.html` with a focused human-facing view of `report.json`. Layout:
 
     Header   — package + device + run window + verdict pill
-    Hero     — verdict bar + 4 event-count cards + derived strip
-    01       — Plotly event timeline (7 lanes: 4 events + 3 lifecycle)
-    02       — process stability table
-    03       — Incidents (filter bar + master/detail)
-    04       — Appendix: bookmarks · effective config · data files
+    Hero     — verdict bar + 3 event-count cards + derived strip
+    01       — Plotly issue-occurrence timeline
+    02       — Root issues (one detail per cluster, with occurrence count)
+    03       — Appendix: bookmarks · effective config · data files
     Footer
 
 All rendering is data-driven: Python embeds the result dict as JSON; the
@@ -24,6 +23,8 @@ from pathlib import Path
 from typing import Dict
 
 from plotly.offline import get_plotlyjs
+
+from ..analyzers.fingerprint import ISSUE_EVENT_TYPES, group_incidents
 
 HTML_FILENAME = "report.html"
 
@@ -48,107 +49,19 @@ def _safe_json(obj) -> str:
     )
 
 
-_CONFIG_IDENTITY_KEYS = ("package", "device", "output_dir", "profile_name")
-_CONFIG_IMPORTANT_MODE_KEYS = (
-    "ci_mode",
-    "dashboard",
-    "plugins_enabled",
-    "redact",
-    "replay_of_run_id",
-    "webhook_url",
-)
-_CONFIG_DEFAULT_TRUE_KEYS = (
-    "emit_html",
-    "enable_anr",
-    "enable_java_crash",
-    "enable_native_crash",
-    "enable_process_death",
-    "logcat_enabled",
-    "pull_anr_trace",
-    "pull_tombstone",
-    "resource_risk_enabled",
-    "self_monitor_enabled",
-)
-
-
-def _has_config_display_value(value) -> bool:
-    if value is None or value == "":
-        return False
-    if isinstance(value, (list, tuple, dict)) and not value:
-        return False
-    return True
+_CONFIG_IDENTITY_KEYS = ("package", "device", "output_dir")
 
 
 def _compact_config(config: Dict) -> Dict:
-    """Keep report HTML focused on identity and explicit/non-default choices.
-
-    The canonical `report.json` still owns the complete effective config.
-    CLI/profile/YAML resolution records explicitly supplied keys in
-    `config_sources`; important mode changes are retained as a compatibility
-    fallback for older reports that do not carry source metadata.
-    """
+    """Expose only the three run identity fields requested for HTML."""
     config = dict(config or {})
-    raw_sources = config.get("config_sources")
-    sources = raw_sources if isinstance(raw_sources, dict) else {}
-    selected = set(_CONFIG_IDENTITY_KEYS)
-    selected.update(str(key) for key in sources)
-    for key in _CONFIG_IMPORTANT_MODE_KEYS:
-        if config.get(key):
-            selected.add(key)
-    for key in _CONFIG_DEFAULT_TRUE_KEYS:
-        if key in config and config[key] is False:
-            selected.add(key)
-
-    values = {
-        key: value
-        for key, value in config.items()
-        if key != "config_sources" and key in selected and _has_config_display_value(value)
-    }
-    visible_sources = {key: sources[key] for key in values if key in sources}
-    total_count = sum(1 for key in config if key != "config_sources")
+    values = {key: config.get(key, "—") for key in _CONFIG_IDENTITY_KEYS}
     return {
         "values": values,
-        "sources": visible_sources,
-        "total_count": total_count,
-        "hidden_count": max(0, total_count - len(values)),
+        "sources": {},
+        "total_count": len(values),
+        "hidden_count": 0,
     }
-
-
-def _render_issue_groups(groups) -> str:
-    """Server-rendered issue-group summary (default view for repeat bugs)."""
-    if not groups:
-        return ""
-    rows = []
-    for g in groups:
-        occ_ids = ", ".join(str(i) for i in g.get("occurrence_ids", []))
-        rows.append(
-            "<details>"
-            "<summary>"
-            f'<span class="chip red">{_html.escape(str(g.get("type", "?")))}</span> '
-            f"{_html.escape(str(g.get('fingerprint', ''))[:12])} · "
-            f"{g.get('occurrence_count', 0)} "
-            '<span class="zh">次发生</span><span class="en">occurrence(s)</span>'
-            "</summary>"
-            f'<div class="mono">'
-            f'<span class="zh">受影响进程</span><span class="en">processes</span>: '
-            f"{_html.escape(', '.join(g.get('affected_processes', [])))}<br>"
-            f'<span class="zh">首次</span><span class="en">first</span>: '
-            f"{_html.escape(str(g.get('first_seen_at', '')))} · "
-            f'<span class="zh">末次</span><span class="en">last</span>: '
-            f"{_html.escape(str(g.get('last_seen_at', '')))}<br>"
-            f'<span class="zh">全部 occurrences</span>'
-            f'<span class="en">all occurrences</span>: {_html.escape(occ_ids)}'
-            "</div>"
-            "</details>"
-        )
-    return (
-        '<section id="issue-groups">'
-        '<div class="sec-head">'
-        '<h2><span class="zh">Issue Groups — 问题聚类</span>'
-        '<span class="en">Issue groups</span></h2>'
-        '<span class="num-tag">02.5</span>'
-        "</div>" + "\n".join(rows) + "</section>"
-    )
 
 
 _CSS = r"""
@@ -319,6 +232,9 @@ _CSS = r"""
   .verdict-bar .vsub {
     font-size: var(--fs-sm); color: var(--muted);
   }
+  .verdict-bar .vsub .guidance { display: block; margin-top: 5px; color: var(--ink-3); }
+  .verdict-bar .vsub .guidance .action { display: block; margin-top: 4px; }
+  .verdict-bar .vsub .guidance strong { color: var(--accent-2); }
 
   .ev-cards {
     display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
@@ -350,8 +266,8 @@ _CSS = r"""
   .ev-card.native .e-head .dot { background: var(--red-deep); }
   .ev-card.anr    .e-head { color: var(--accent-2); }
   .ev-card.anr    .e-head .dot { background: var(--accent-2); }
-  .ev-card.death  .e-head { color: var(--gray); }
-  .ev-card.death  .e-head .dot { background: var(--gray); }
+  .ev-card.other  .e-head { color: var(--gray); }
+  .ev-card.other  .e-head .dot { background: var(--gray); }
   .ev-card .e-count {
     font-family: "SF Mono", "JetBrains Mono", Menlo, monospace;
     font-size: var(--fs-hero); font-weight: 700;
@@ -364,7 +280,7 @@ _CSS = r"""
   .ev-card.java:not(.zero)   .e-count { color: var(--red); }
   .ev-card.native:not(.zero) .e-count { color: var(--red-deep); }
   .ev-card.anr:not(.zero)    .e-count { color: var(--accent-2); }
-  .ev-card.death:not(.zero)  .e-count { color: var(--gray); }
+  .ev-card.other:not(.zero)  .e-count { color: var(--gray); }
   .ev-card .e-sub {
     font-size: var(--fs-sm); color: var(--ink-3);
     margin-bottom: 4px; min-height: 1.6em;
@@ -392,6 +308,42 @@ _CSS = r"""
     color: var(--ink); font-weight: 600;
   }
   .derived .d .val.warn { color: var(--accent-2); }
+
+  .help-tip {
+    appearance: none;
+    width: 18px; height: 18px;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0; margin-left: 4px;
+    border: 1px solid #9ca3af; border-radius: 999px;
+    background: #fff; color: var(--muted);
+    font: 700 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    cursor: help; position: relative; vertical-align: middle;
+    text-transform: none; letter-spacing: 0;
+  }
+  .help-tip:hover, .help-tip:focus-visible, .help-tip.open {
+    color: var(--accent); border-color: var(--accent); outline: none;
+  }
+  .help-tip::after {
+    content: attr(data-help-zh);
+    position: absolute; z-index: 30;
+    left: 50%; bottom: calc(100% + 9px); transform: translateX(-50%);
+    width: min(340px, calc(100vw - 48px));
+    padding: 10px 12px; border-radius: 5px;
+    background: var(--ink); color: #fff;
+    font: 500 13px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    text-align: left; white-space: normal; letter-spacing: 0;
+    box-shadow: 0 8px 24px rgba(15,23,42,0.22);
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity .12s ease, visibility .12s ease;
+  }
+  [data-lang="en"] .help-tip::after { content: attr(data-help-en); }
+  .help-tip:hover::after, .help-tip:focus-visible::after, .help-tip.open::after {
+    opacity: 1; visibility: visible;
+  }
+  .ev-card:last-child .help-tip::after,
+  .stat:nth-child(4) .help-tip::after {
+    left: auto; right: 0; transform: none;
+  }
 
   /* ===== TIMELINE ===== */
   .rail {
@@ -539,12 +491,12 @@ _CSS = r"""
   .filter-chip[data-type="java_crash"][data-active="true"]     { background: var(--red); border-color: var(--red); }
   .filter-chip[data-type="native_crash"][data-active="true"]   { background: var(--red-deep); border-color: var(--red-deep); }
   .filter-chip[data-type="anr"][data-active="true"]            { background: var(--accent-2); border-color: var(--accent-2); }
-  .filter-chip[data-type="process_death"][data-active="true"]  { background: var(--gray); border-color: var(--gray); }
+  .filter-chip[data-type="other"][data-active="true"]          { background: var(--gray); border-color: var(--gray); }
 
   .filter-chip[data-type="java_crash"]::before    { background: var(--red); }
   .filter-chip[data-type="native_crash"]::before  { background: var(--red-deep); }
   .filter-chip[data-type="anr"]::before           { background: var(--accent-2); }
-  .filter-chip[data-type="process_death"]::before { background: var(--gray); }
+  .filter-chip[data-type="other"]::before         { background: var(--gray); }
   .filter-chip[data-type="all"]::before           { background: var(--ink); }
 
   .filter-row {
@@ -612,7 +564,7 @@ _CSS = r"""
   .inc-item.type-java_crash    { border-left-color: var(--red); }
   .inc-item.type-native_crash  { border-left-color: var(--red-deep); }
   .inc-item.type-anr           { border-left-color: var(--accent-2); }
-  .inc-item.type-process_death { border-left-color: var(--gray); }
+  .inc-item.type-other         { border-left-color: var(--gray); }
   .inc-item:hover { background: rgba(29,78,216,0.04); }
   .inc-item.active { background: var(--bg); }
   .inc-item.flash {
@@ -675,8 +627,10 @@ _CSS = r"""
     font-size: var(--fs-mid); font-weight: 700;
     color: var(--ink);
     font-variant-numeric: tabular-nums;
-    word-break: break-all; line-height: 1.3;
+    word-break: normal; overflow-wrap: anywhere; line-height: 1.3;
   }
+  .stat.wide { grid-column: 1 / -1; }
+  .stat.wide .v { font-size: var(--fs-sm); font-weight: 600; line-height: 1.55; }
   .stat .v.red { color: var(--red); }
   .stat .v.orange { color: var(--accent-2); }
 
@@ -695,7 +649,7 @@ _CSS = r"""
   }
   .summary-box.native_crash  { border-left-color: var(--red-deep); }
   .summary-box.anr           { border-left-color: var(--accent-2); }
-  .summary-box.process_death { border-left-color: var(--gray); }
+  .summary-box.other         { border-left-color: var(--gray); }
 
   .frames {
     background: #0f172a;
@@ -720,12 +674,17 @@ _CSS = r"""
     transition: background 0.1s ease;
   }
   .frames .f-line:hover { background: rgba(255,255,255,0.06); }
+  .frames .f-line:focus-visible { outline: 1px solid #93c5fd; outline-offset: 2px; }
   .frames .f-line.copied { background: rgba(21,128,61,0.25); }
+  .frames .f-line.copy-failed { background: rgba(185,28,28,0.28); }
   .frames .f-line .idx { color: #64748b; min-width: 28px; }
   .frames .f-line > span:last-child { min-width: 0; }
   .frames .f-line.biz { background: rgba(245,158,11,0.14); color: #fde68a; }
   .frames .f-line.biz:hover { background: rgba(245,158,11,0.22); }
   .frames .f-empty { color: #94a3b8; font-style: italic; }
+  .copy-state { display: inline-block; min-width: 72px; margin-left: 8px; font-weight: 600; }
+  .copy-state.ok { color: var(--green); }
+  .copy-state.fail { color: var(--red); }
 
   .file-line {
     display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap;
@@ -791,7 +750,10 @@ _CSS = r"""
     color: var(--muted);
     font-size: var(--fs-sm);
   }
-  .cfg-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 38px; padding-top: 18px; }
+  .cfg-grid { display: block; padding-top: 18px; }
+  .cfg-group {
+    display: block;
+  }
   .cfg-group .g-title {
     font-size: var(--fs-xs); color: var(--muted);
     text-transform: uppercase; letter-spacing: 0.08em;
@@ -800,16 +762,20 @@ _CSS = r"""
     font-weight: 700;
   }
   .cfg-group .kv {
-    display: flex; justify-content: space-between;
+    display: grid; grid-template-columns: 130px minmax(0, 1fr); align-items: baseline;
     padding: 8px 0;
     font-size: var(--fs-sm);
-    gap: 10px;
+    gap: 18px;
   }
   .cfg-group .kv .k { color: var(--ink-3); }
   .cfg-group .kv .v {
     font-family: "SF Mono", Menlo, monospace;
     color: var(--ink); font-weight: 500;
-    text-align: right; word-break: break-all;
+    min-width: 0; text-align: left; word-break: normal; overflow-wrap: anywhere;
+  }
+  @media (min-width: 1000px) {
+    .cfg-group .kv { grid-template-columns: 100px minmax(0, 1fr); gap: 12px; }
+    .cfg-group .kv .v { font-size: 12px; white-space: nowrap; }
   }
   .cfg-group .kv .v.bool-y { color: var(--green); }
   .cfg-group .kv .v.bool-n { color: var(--muted); }
@@ -969,10 +935,12 @@ _BODY_SKELETON = r"""
           <div class="e-count" id="cnt-anr">0</div>
           <div class="e-sub" id="sub-anr"></div>
         </div>
-        <div class="ev-card death" data-card-type="process_death">
-          <div class="e-head"><span class="dot"></span><span>Process death</span></div>
-          <div class="e-count" id="cnt-process_death">0</div>
-          <div class="e-sub" id="sub-process_death"></div>
+        <div class="ev-card other" data-card-type="other">
+          <div class="e-head"><span class="dot"></span><span class="zh">其他</span><span class="en">Other</span>
+            <button class="help-tip" id="other-help" type="button" aria-label="其他类别说明">?</button>
+          </div>
+          <div class="e-count" id="cnt-other">0</div>
+          <div class="e-sub" id="sub-other"></div>
         </div>
       </div>
 
@@ -986,8 +954,8 @@ _BODY_SKELETON = r"""
       <h2><span class="zh">事件时间轴</span><span class="en">Event timeline</span></h2>
       <span class="num-tag">01</span>
       <span class="desc">
-        <span class="zh">上半部 4 行为事件、下半部 3 行为生命周期 · 点击标记跳转</span>
-        <span class="en">top 4 lanes = events, bottom 3 = lifecycle · click any marker to jump</span>
+        <span class="zh">每个标记代表一次问题发生 · 点击标记跳转到对应根问题</span>
+        <span class="en">each marker is one occurrence · click to open its root issue</span>
       </span>
     </div>
     <div class="rail">
@@ -997,10 +965,7 @@ _BODY_SKELETON = r"""
           <span class="item"><span class="sw x-red"></span>Java crash</span>
           <span class="item"><span class="sw x-rd"></span>Native crash</span>
           <span class="item"><span class="sw x-or"></span>ANR</span>
-          <span class="item"><span class="sw x-gr"></span>Process death</span>
-          <span class="item"><span class="sw d-g"></span><span class="zh">进程新增</span><span class="en">new</span></span>
-          <span class="item"><span class="sw d-or"></span><span class="zh">进程重启</span><span class="en">restart</span></span>
-          <span class="item"><span class="sw d-gr"></span><span class="zh">进程消失</span><span class="en">gone</span></span>
+          <span class="item"><span class="sw x-gr"></span><span class="zh">其他</span><span class="en">Other</span></span>
           <span class="item"><span class="sw l-b"></span><span class="zh">书签</span><span class="en">bookmark</span></span>
         </div>
       </div>
@@ -1008,49 +973,15 @@ _BODY_SKELETON = r"""
     </div>
   </section>
 
-  <!-- PROCESS TABLE -->
-  <section>
-    <div class="sec-head">
-      <h2><span class="zh">进程稳定性总表</span><span class="en">Process stability</span></h2>
-      <span class="num-tag">02</span>
-      <span class="desc">
-        <span class="zh">点击事件计数可在下方筛选该进程的该类事件</span>
-        <span class="en">click a count to filter the incidents list below</span>
-      </span>
-    </div>
-    <div class="table-wrap">
-      <div class="table-scroll">
-        <table class="tbl">
-          <thead>
-            <tr>
-              <th><span class="zh">进程</span><span class="en">Process</span></th>
-              <th><span class="zh">首次发现</span><span class="en">First seen</span></th>
-              <th><span class="zh">最后发现</span><span class="en">Last seen</span></th>
-              <th class="r"><span class="zh">在线率</span><span class="en">Uptime</span></th>
-              <th class="r"><span class="zh">重启</span><span class="en">Restart</span></th>
-              <th class="r">Java</th>
-              <th class="r">Native</th>
-              <th class="r">ANR</th>
-              <th class="r"><span class="zh">退出</span><span class="en">P.death</span></th>
-              <th class="r"><span class="zh">取样失败</span><span class="en">Sample fail</span></th>
-            </tr>
-          </thead>
-          <tbody id="proc-tbody"></tbody>
-        </table>
-      </div>
-    </div>
-  </section>
-
-  <!-- ISSUE_GROUPS -->
   <!-- INCIDENTS -->
   <section>
     <div class="sec-head">
       <h2><span class="zh">Incidents — 稳定性事件</span><span class="en">Incidents</span></h2>
-      <span class="num-tag">03</span>
+      <span class="num-tag">02</span>
       <span class="desc">
         <span id="inc-desc-count"></span>
-        <span class="zh"> · 选中条目查看堆栈与现场快照 · </span>
-        <span class="en"> · select a row to view stack &amp; evidence · </span>
+        <span class="zh"> · 同类问题仅显示一次，详情中展示发生次数 · </span>
+        <span class="en"> · one detail per root issue, with occurrence count · </span>
         <kbd>/</kbd>
         <span class="zh"> 聚焦搜索</span>
         <span class="en"> to search</span>
@@ -1071,8 +1002,8 @@ _BODY_SKELETON = r"""
         <button class="filter-chip" type="button" data-type="anr">
           ANR&nbsp;<span class="cnt" data-cnt-for="anr">(0)</span>
         </button>
-        <button class="filter-chip" type="button" data-type="process_death">
-          Process death&nbsp;<span class="cnt" data-cnt-for="process_death">(0)</span>
+        <button class="filter-chip" type="button" data-type="other">
+          <span class="zh">其他</span><span class="en">Other</span>&nbsp;<span class="cnt" data-cnt-for="other">(0)</span>
         </button>
       </div>
       <div class="filter-row">
@@ -1120,7 +1051,7 @@ _BODY_SKELETON = r"""
   <section>
     <div class="sec-head">
       <h2><span class="zh">附加信息</span><span class="en">Appendix</span></h2>
-      <span class="num-tag">04</span>
+      <span class="num-tag">03</span>
       <span class="desc">
         <span class="zh">书签 · 配置 · 数据文件</span>
         <span class="en">bookmarks · effective config · data files</span>
@@ -1142,8 +1073,8 @@ _BODY_SKELETON = r"""
       </summary>
       <div class="body">
         <div class="cfg-note">
-          <span class="zh">仅展示关键标识和显式配置项；使用默认值的配置已隐藏，完整有效配置保留在 report.json。</span>
-          <span class="en">Only identity and explicitly configured values are shown; defaults are hidden. The full effective config remains in report.json.</span>
+          <span class="zh">网页仅展示 package、device、output_dir；完整配置保留在 report.json。</span>
+          <span class="en">HTML shows only package, device and output_dir; the full config remains in report.json.</span>
         </div>
         <div class="cfg-grid" id="cfg-grid"></div>
       </div>
@@ -1183,31 +1114,25 @@ _JS = r"""
     try { return JSON.parse(txt); } catch (e) { return null; }
   }
 
-  var report    = readJson('report-data')    || { run: {}, processes: [], bookmarks: [] };
+  var report    = readJson('report-data')    || { run: {}, bookmarks: [] };
   var incidents = readJson('incidents-data') || [];
-  var lifecycle = readJson('lifecycle-data') || [];
+  var occurrences = readJson('occurrences-data') || [];
   var deviceEvents = readJson('device-events-data') || [];
   var dataFiles = readJson('files-data')     || { events: [], lifecycle: [], logcat: [] };
   var configPayload = readJson('config-data') || {};
   var configEff = configPayload.values || configPayload;
-  var configMeta = configPayload.values ? configPayload : {
-    total_count: Object.keys(configEff).length,
-    hidden_count: 0,
-    sources: {},
-  };
 
   var run       = report.run || {};
-  var processes = report.processes || [];
   var bookmarks = report.bookmarks || [];
 
   var TYPE_LABELS = {
     java_crash:    { zh: 'Java crash',    en: 'Java crash',    color: '#b91c1c' },
     native_crash:  { zh: 'Native crash',  en: 'Native crash',  color: '#7f1d1d' },
     anr:           { zh: 'ANR',           en: 'ANR',           color: '#c2410c' },
-    process_death: { zh: 'Process death', en: 'Process death', color: '#4b5563' },
+    other:         { zh: '其他',           en: 'Other',         color: '#4b5563' },
   };
   var TYPE_CLS = {
-    java_crash: 'red', native_crash: 'red-deep', anr: 'orange', process_death: 'gray',
+    java_crash: 'red', native_crash: 'red-deep', anr: 'orange', other: 'gray',
   };
   var SEV_LABELS = {
     fatal:   { zh: 'fatal',   en: 'fatal',   cls: 'fatal' },
@@ -1246,24 +1171,101 @@ _JS = r"""
   }
   function escapeAttr(s) { return escapeHtml(s); }
 
+  async function copyText(text) {
+    if (!text) return false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(String(text));
+        return true;
+      }
+    } catch (e) {}
+    var area = document.createElement('textarea');
+    area.value = String(text);
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.left = '-9999px';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    var copied = false;
+    try { copied = document.execCommand('copy'); } catch (e) { copied = false; }
+    document.body.removeChild(area);
+    return copied;
+  }
+
+  function helpTipMarkup(zh, en, aria) {
+    return '<button class="help-tip" type="button" aria-label="' + escapeAttr(aria || zh) + '"' +
+      ' data-help-zh="' + escapeAttr(zh) + '" data-help-en="' + escapeAttr(en) + '">?</button>';
+  }
+
+  function initHelpTips() {
+    document.addEventListener('click', function (event) {
+      var tip = event.target.closest && event.target.closest('.help-tip');
+      var tips = Array.prototype.slice.call(document.querySelectorAll('.help-tip'));
+      if (!tip) {
+        tips.forEach(function (item) { item.classList.remove('open'); });
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      var willOpen = !tip.classList.contains('open');
+      tips.forEach(function (item) { item.classList.remove('open'); });
+      tip.classList.toggle('open', willOpen);
+    });
+    document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape') {
+        document.querySelectorAll('.help-tip').forEach(function (tip) { tip.classList.remove('open'); });
+      }
+    });
+  }
+
+  function collectionGuidance(covTxt) {
+    var collectors = report.collectors || {};
+    var stats = collectors.logcat || {};
+    var missingSec = Math.max(0, Number(run.duration_sec || 0) * (1 - Number(report.coverage_ratio || 0)));
+    var delays = (stats.first_line_delays || []).map(Number).filter(isFinite);
+    var firstDelay = delays.length ? Math.max.apply(Math, delays) : 0;
+    var reasonZh = '', reasonEn = '', actionZh = '', actionEn = '';
+    if (firstDelay > 1) {
+      reasonZh = 'logcat 启动后 ' + firstDelay.toFixed(1) + ' 秒才收到首行，跑测开头约 ' + missingSec.toFixed(1) + ' 秒没有日志覆盖。';
+      reasonEn = 'The first logcat line arrived ' + firstDelay.toFixed(1) + 's after startup, leaving about ' + missingSec.toFixed(1) + 's uncovered.';
+      actionZh = '在开始跑测计时前等待 logcat 首行就绪；若仍然延迟，检查 adb 连接和设备 logcat 启动速度。';
+      actionEn = 'Wait for the first logcat line before starting the run timer; if the delay remains, check adb connectivity and device logcat startup.';
+    } else if (Number(stats.reconnects || 0) > 0 || Number(stats.read_failures || 0) > 0) {
+      reasonZh = 'logcat 采集期间重连 ' + Number(stats.reconnects || 0) + ' 次、读取失败 ' + Number(stats.read_failures || 0) + ' 次，约 ' + missingSec.toFixed(1) + ' 秒没有覆盖。';
+      reasonEn = 'logcat reconnected ' + Number(stats.reconnects || 0) + ' time(s) with ' + Number(stats.read_failures || 0) + ' read failure(s), leaving about ' + missingSec.toFixed(1) + 's uncovered.';
+      actionZh = '检查 adb 连接稳定性、设备离线记录和 logcat 读取错误，修复后重跑。';
+      actionEn = 'Check adb stability, device-offline records and logcat read errors, then re-run.';
+    } else {
+      var rawReasons = report.collection_health_reasons || [];
+      reasonZh = rawReasons.length ? rawReasons.join('；') : '有效 logcat 覆盖时间比跑测窗口少约 ' + missingSec.toFixed(1) + ' 秒。';
+      reasonEn = rawReasons.length ? rawReasons.join('; ') : 'Effective logcat coverage is about ' + missingSec.toFixed(1) + 's shorter than the run window.';
+      actionZh = '检查采集器启动、停止和设备离线时间段，确保整个跑测窗口都有日志后重跑。';
+      actionEn = 'Inspect collector startup/shutdown and device-offline gaps, then re-run with log coverage for the full window.';
+    }
+    return {
+      zh: 'logcat 覆盖率 ' + covTxt + '，低于 ' + Number(report.coverage_threshold || 0.99) * 100 + '% 阈值。' +
+          '<span class="guidance"><span class="cause"><strong>具体原因：</strong>' + escapeHtml(reasonZh) + '</span>' +
+          '<span class="action"><strong>修改建议：</strong>' + escapeHtml(actionZh) + '</span></span>',
+      en: 'logcat coverage ' + covTxt + ' is below the ' + Number(report.coverage_threshold || 0.99) * 100 + '% threshold.' +
+          '<span class="guidance"><span class="cause"><strong>Cause:</strong> ' + escapeHtml(reasonEn) + '</span>' +
+          '<span class="action"><strong>Action:</strong> ' + escapeHtml(actionEn) + '</span></span>'
+    };
+  }
+
   // counts
-  var counts = { java_crash: 0, native_crash: 0, anr: 0, process_death: 0 };
+  var counts = { java_crash: 0, native_crash: 0, anr: 0, other: 0 };
   incidents.forEach(function (i) {
-    if (counts[i.type] != null) counts[i.type] += 1;
+    if (counts[i.type] != null) counts[i.type] += Number(i.occurrence_count || 1);
   });
   var totalIncidents = incidents.length;
+  var totalOccurrences = counts.java_crash + counts.native_crash + counts.anr + counts.other;
   var totalCrashes   = counts.java_crash + counts.native_crash;
   var totalAnr       = counts.anr;
-  var totalDeath     = counts.process_death;
+  var totalOther     = counts.other;
   var incidentSummary = report.incident_summary || {};
-  var correlatedTerminations = incidentSummary.correlated_termination_count;
-  if (correlatedTerminations == null) {
-    correlatedTerminations = incidents.filter(function (i) {
-      return !!((i.evidence || {}).secondary_to_incident_id);
-    }).length;
-  }
   var rootProblemCount = incidentSummary.root_problem_count;
-  if (rootProblemCount == null) rootProblemCount = totalIncidents - correlatedTerminations;
+  if (rootProblemCount == null) rootProblemCount = totalIncidents;
 
   // ============ HEADER + VERDICT ============
   function renderHeader() {
@@ -1297,10 +1299,10 @@ _JS = r"""
     var pillText  = exitOk
       ? '<span class="zh">正常结束 · ' + escapeHtml(reason) + '</span><span class="en">' + escapeHtml(reason) + '</span>'
       : '<span class="zh">异常退出 · ' + escapeHtml(reason) + '</span><span class="en">' + escapeHtml(reason) + '</span>';
-    var micro = exitOk && totalIncidents === 0
+    var micro = exitOk && totalOccurrences === 0
       ? '<span class="zh">exit_code = 0 · 未检测到稳定性事件</span><span class="en">exit_code = 0 · no stability events</span>'
-      : '<span class="zh">exit_code = ' + run.exit_code + ' · ' + totalIncidents + ' 条观测记录 / ' + rootProblemCount + ' 个根问题</span>' +
-        '<span class="en">exit_code = ' + run.exit_code + ' · ' + totalIncidents + ' observations / ' + rootProblemCount + ' root problems</span>';
+      : '<span class="zh">exit_code = ' + run.exit_code + ' · ' + totalOccurrences + ' 次发生 / ' + rootProblemCount + ' 类问题</span>' +
+        '<span class="en">exit_code = ' + run.exit_code + ' · ' + totalOccurrences + ' occurrences / ' + rootProblemCount + ' root issues</span>';
     document.getElementById('verdict-pill').innerHTML =
       '<span class="pill ' + pillCls + '">' + pillIcon + ' ' + pillText + '</span>' +
       '<span class="micro">' + micro + '</span>';
@@ -1332,44 +1334,55 @@ _JS = r"""
       cls = 'orange';
       titleZh = '观测不完整 · 结论不可判定';
       titleEn = 'Incomplete observation · inconclusive';
-      subZh = 'logcat 覆盖率 ' + covTxt + '，低于可信阈值；修复采集器后重跑';
-      subEn = 'logcat coverage ' + covTxt + ' is below the confidence threshold; fix the collector and re-run';
+      var guidance = collectionGuidance(covTxt);
+      subZh = guidance.zh;
+      subEn = guidance.en;
       iconSvg = '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="13"/><circle cx="12" cy="16.5" r="1"/>';
       bar.className = 'verdict-bar ' + cls;
-      titleEl.textContent = titleZh;
-      subEl.innerHTML = subZh;
+      titleEl.innerHTML = '<span class="zh">' + escapeHtml(titleZh) + '</span><span class="en">' + escapeHtml(titleEn) + '</span>';
+      subEl.innerHTML = '<span class="zh">' + subZh + '</span><span class="en">' + subEn + '</span>';
       document.querySelector('.vicon').innerHTML = iconSvg;
       return;
     }
-    if (totalIncidents === 0) {
+    if (totalOccurrences === 0) {
       cls = 'green';
       titleZh = '未检测到稳定性事件 · 整体健康';
       titleEn = 'No stability events detected · healthy run';
-      subZh = '跑测窗口内无 Java/Native crash、ANR 或异常退出';
-      subEn = 'No Java/Native crash, ANR or unexpected death within the window';
+      subZh = '跑测窗口内无 Java crash、Native crash、ANR 或其他稳定性问题';
+      subEn = 'No Java crash, Native crash, ANR or other stability issue within the window';
       iconSvg = '<circle cx="12" cy="12" r="10"/><polyline points="8,12.5 11,15.5 16,9.5"/>';
     } else if (totalCrashes > 0) {
       cls = 'red';
       var parts = [];
       if (totalCrashes > 0) parts.push(tr(totalCrashes + ' 次崩溃', totalCrashes + ' crashes'));
       if (totalAnr > 0)     parts.push(tr(totalAnr + ' 次 ANR', totalAnr + ' ANRs'));
+      if (totalOther > 0)   parts.push(tr(totalOther + ' 次其他问题', totalOther + ' other issues'));
       titleZh = '测试期间发生 ' + parts.join('、').replace(/次/g, '次') + (parts.length === 0 ? '' : '');
       titleZh = (totalCrashes > 0 ? totalCrashes + ' 次崩溃' : '') +
                 (totalCrashes > 0 && totalAnr > 0 ? '，同时踩中 ' : '') +
-                (totalAnr > 0 ? totalAnr + ' 次 ANR' : '');
+                (totalAnr > 0 ? totalAnr + ' 次 ANR' : '') +
+                (totalOther > 0 ? '，另有 ' + totalOther + ' 次其他问题' : '');
       titleZh = '测试期间发生 ' + titleZh;
       titleEn = (totalCrashes > 0 ? totalCrashes + ' crashes' : '') +
                 (totalCrashes > 0 && totalAnr > 0 ? ' and ' : '') +
-                (totalAnr > 0 ? totalAnr + ' ANRs' : '') + ' detected during the run';
+                (totalAnr > 0 ? totalAnr + ' ANRs' : '') +
+                (totalOther > 0 ? ' and ' + totalOther + ' other issues' : '') + ' detected during the run';
       subZh = '⚠ "exit_code = 0" 仅表示跑测正常结束 · 测试结果并不健康，查看下方 Incidents 区定位首条事件';
       subEn = '⚠ "exit_code = 0" only means the run finished — the result is unhealthy. See Incidents below to locate the first event.';
       iconSvg = '<circle cx="12" cy="12" r="10"/><line x1="12" y1="7" x2="12" y2="13"/><circle cx="12" cy="16.5" r="1" fill="currentColor"/>';
     } else {
       cls = 'orange';
-      titleZh = '检测到 ' + totalIncidents + ' 个事件（未含崩溃）';
-      titleEn = totalIncidents + ' events detected (no crashes)';
-      subZh  = '⚠ 包含 ANR / 进程异常退出，查看下方 Incidents 列表';
-      subEn  = '⚠ Includes ANRs / process deaths — see Incidents list below';
+      titleZh = '测试期间发生 ' +
+        (totalAnr ? totalAnr + ' 次 ANR' : '') +
+        (totalAnr && totalOther ? '、' : '') +
+        (totalOther ? totalOther + ' 次其他问题' : '');
+      titleEn =
+        (totalAnr ? totalAnr + ' ANRs' : '') +
+        (totalAnr && totalOther ? ' and ' : '') +
+        (totalOther ? totalOther + ' other issues' : '') +
+        ' detected during the run';
+      subZh  = '⚠ 查看下方问题详情定位根因';
+      subEn  = '⚠ See the root-issue details below';
       iconSvg = '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><circle cx="12" cy="17" r="1" fill="currentColor"/>';
     }
 
@@ -1382,7 +1395,7 @@ _JS = r"""
 
   // ============ HERO CARDS ============
   function renderHeroCards() {
-    ['java_crash', 'native_crash', 'anr', 'process_death'].forEach(function (type) {
+    ['java_crash', 'native_crash', 'anr', 'other'].forEach(function (type) {
       var n = counts[type];
       var cntEl = document.getElementById('cnt-' + type);
       var subEl = document.getElementById('sub-' + type);
@@ -1431,52 +1444,57 @@ _JS = r"""
         sub = rk.length > 0
           ? '<span class="zh">' + escapeHtml(rk.slice(0, 3).join(' · ')) + '</span><span class="en">' + escapeHtml(rk.slice(0, 3).join(' · ')) + '</span>'
           : '<span class="zh">涉及 ' + procCount + ' 个进程</span><span class="en">affects ' + procCount + ' process' + (procCount === 1 ? '' : 'es') + '</span>';
-      } else {
-        sub = '<span class="zh">涉及 ' + procCount + ' 个进程</span><span class="en">across ' + procCount + ' process' + (procCount === 1 ? '' : 'es') + '</span>';
+      } else if (type === 'other') {
+        var otherKinds = {};
+        incidents.forEach(function (i) {
+          if (i.type === 'other') {
+            var category = (i.evidence || {}).original_type || 'unknown';
+            otherKinds[category] = true;
+          }
+        });
+        var ok = Object.keys(otherKinds).sort();
+        sub = ok.length
+          ? '<span class="zh">' + escapeHtml(ok.slice(0, 2).join(' · ')) + (ok.length > 2 ? ' 等' : '') + '</span><span class="en">' + escapeHtml(ok.slice(0, 2).join(' · ')) + (ok.length > 2 ? ' +' + (ok.length - 2) : '') + '</span>'
+          : '<span class="zh">暂无其他问题</span><span class="en">no other issues</span>';
       }
       subEl.innerHTML = sub;
     });
+    var otherCategories = incidents.filter(function (i) { return i.type === 'other'; }).map(function (i) {
+      return (i.evidence || {}).original_type || 'unknown';
+    }).filter(function (value, index, values) { return values.indexOf(value) === index; }).sort();
+    var otherHelp = document.getElementById('other-help');
+    var categoryZh = otherCategories.length ? '当前包含：' + otherCategories.join('、') : '当前报告暂无此类问题';
+    var categoryEn = otherCategories.length ? 'Current categories: ' + otherCategories.join(', ') : 'This report has no issue in this category';
+    otherHelp.setAttribute('data-help-zh', '无法归入 Java crash、Native crash 或 ANR 的稳定性问题会进入“其他”。' + categoryZh + '。Process death 明确排除。');
+    otherHelp.setAttribute('data-help-en', 'Stability issues that are not Java crash, Native crash or ANR are placed in Other. ' + categoryEn + '. Process death is explicitly excluded.');
   }
 
   // ============ DERIVED STRIP ============
   function renderDerivedStrip() {
     var strip = document.getElementById('derived-strip');
-    var nProc = processes.length;
-    var avgUp = nProc > 0
-      ? (processes.reduce(function (s, p) { return s + (p.uptime_ratio || 0); }, 0) / nProc) * 100
-      : 0;
-    var totalLogFail = 0, totalDropFail = 0;
-    processes.forEach(function (p) {
-      var sf = p.sample_failures || {};
-      totalLogFail  += sf.logcat  || 0;
-      totalDropFail += sf.dropbox || 0;
-    });
     var buffers = (configEff.logcat_buffers || ['main', 'system', 'events', 'crash']).join(' · ');
-    var totalFail = totalLogFail + totalDropFail;
-    var failHtml = totalFail > 0
-      ? '<span class="d"><span class="lbl"><span class="zh">取样失败</span><span class="en">sample failures</span></span>' +
-        '<span class="val warn">logcat ' + totalLogFail + ' · dropbox ' + totalDropFail + '</span></span>'
-      : '';
     strip.innerHTML =
-      '<span class="d"><span class="lbl"><span class="zh">平均在线率</span><span class="en">avg uptime</span></span>' +
-      '<span class="val">' + (nProc > 0 ? avgUp.toFixed(1) + ' %' : '—') + '</span></span>' +
-      '<span class="d"><span class="lbl"><span class="zh">根问题 / 观测</span><span class="en">root / observations</span></span>' +
-      '<span class="val">' + rootProblemCount + ' / ' + totalIncidents +
-      (correlatedTerminations ? ' <span class="v-muted">(+' + correlatedTerminations + ' death)</span>' : '') + '</span></span>' +
-      '<span class="d"><span class="lbl">logcat buffers</span><span class="val">' + escapeHtml(buffers) + '</span></span>' +
-      failHtml;
+      '<span class="d"><span class="lbl"><span class="zh">问题 / 发生次数</span><span class="en">issues / occurrences</span></span>' +
+      '<span class="val">' + rootProblemCount + ' / ' + totalOccurrences + '</span></span>' +
+      '<span class="d"><span class="lbl"><span class="zh">聚类方法</span><span class="en">clustering</span></span>' +
+      '<span class="val">TraceSim · complete-link ' + helpTipMarkup(
+        '先按问题类型和关键根因设置硬边界，再用位置和稀有度加权的堆栈相似度计算。complete-link 要求候选问题与组内每个问题都达到阈值，避免粗暴合并。',
+        'Hard type/root-cause gates are applied first, then stack similarity is weighted by position and rarity. Complete-link requires a candidate to pass the threshold against every member, preventing aggressive merges.',
+        '聚类方法说明'
+      ) + '</span></span>' +
+      '<span class="d"><span class="lbl">logcat buffers</span><span class="val">' + escapeHtml(buffers) + '</span></span>';
   }
 
   // ============ TYPE CHIP COUNTS ============
   function renderTypeChipCounts() {
-    document.querySelector('[data-cnt-for="all"]').textContent = '(' + totalIncidents + ')';
-    ['java_crash', 'native_crash', 'anr', 'process_death'].forEach(function (t) {
+    document.querySelector('[data-cnt-for="all"]').textContent = '(' + totalOccurrences + ')';
+    ['java_crash', 'native_crash', 'anr', 'other'].forEach(function (t) {
       var el = document.querySelector('[data-cnt-for="' + t + '"]');
       if (el) el.textContent = '(' + counts[t] + ')';
     });
     document.getElementById('inc-desc-count').innerHTML =
-      '<span class="zh">' + totalIncidents + ' 条观测 · ' + rootProblemCount + ' 个根问题</span>' +
-      '<span class="en">' + totalIncidents + ' observations · ' + rootProblemCount + ' root problems</span>';
+      '<span class="zh">' + totalOccurrences + ' 次发生 · ' + rootProblemCount + ' 类问题</span>' +
+      '<span class="en">' + totalOccurrences + ' occurrences · ' + rootProblemCount + ' root issues</span>';
     document.getElementById('list-count').textContent = totalIncidents + ' / ' + totalIncidents;
   }
 
@@ -1485,64 +1503,8 @@ _JS = r"""
     var sel = document.getElementById('proc-filter');
     var opts = ['<option value="all">' + tr('全部进程', 'All processes') + '</option>'];
     var seen = {};
-    processes.forEach(function (p) { if (!seen[p.name]) { seen[p.name] = true; opts.push('<option value="' + escapeAttr(p.name) + '">' + escapeHtml(p.name) + '</option>'); } });
-    // also include any incident.process not in processes
     incidents.forEach(function (i) { if (i.process && !seen[i.process]) { seen[i.process] = true; opts.push('<option value="' + escapeAttr(i.process) + '">' + escapeHtml(i.process) + '</option>'); } });
     sel.innerHTML = opts.join('');
-  }
-
-  // ============ PROCESS TABLE ============
-  function renderProcessTable() {
-    var tbody = document.getElementById('proc-tbody');
-    if (processes.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="10" class="v-muted" style="text-align:center;padding:24px;">' +
-        tr('未观察到任何进程', 'No processes observed') + '</td></tr>';
-      return;
-    }
-    var rows = processes.map(function (p) {
-      var up = p.uptime_ratio || 0;
-      var upPct = (up * 100).toFixed(1);
-      var upWarn = up < 0.90;
-      var ev = p.events || {};
-      var sf = p.sample_failures || {};
-      var sampleFail = (sf.logcat || 0) + (sf.dropbox || 0);
-      function cnt(type, n, cls) {
-        if (n === 0) return '<span class="v-muted">0</span>';
-        return '<span class="chip ' + cls + ' cnt-link" data-proc="' + escapeAttr(p.name) + '" data-type="' + type + '">' + n + '</span>';
-      }
-      return '<tr>' +
-        '<td class="mono">' + escapeHtml(p.name) + '</td>' +
-        '<td class="mono">' + fmtTimeShort(p.first_seen_at) + '</td>' +
-        '<td class="mono">' + fmtTimeShort(p.last_seen_at)  + '</td>' +
-        '<td class="r"><span class="uptime-cell">' +
-          '<span class="uptime-bar"><span class="fill' + (upWarn ? ' warn' : '') + '" style="width:' + upPct + '%"></span></span>' +
-          '<span class="uptime-val' + (upWarn ? ' warn' : '') + '">' + upPct + ' %</span>' +
-        '</span></td>' +
-        '<td class="r">' + (p.restart_count === 0 ? '<span class="v-muted">—</span>' : '<span class="chip orange">' + p.restart_count + '</span>') + '</td>' +
-        '<td class="r">' + cnt('java_crash',    ev.java_crash    || 0, 'red')      + '</td>' +
-        '<td class="r">' + cnt('native_crash',  ev.native_crash  || 0, 'red-deep') + '</td>' +
-        '<td class="r">' + cnt('anr',           ev.anr           || 0, 'orange')   + '</td>' +
-        '<td class="r">' + cnt('process_death', ev.process_death || 0, 'gray')     + '</td>' +
-        '<td class="r" title="logcat=' + (sf.logcat || 0) + ' · dropbox=' + (sf.dropbox || 0) + '">' +
-          (sampleFail === 0 ? '<span class="v-muted">—</span>' : '<span class="chip orange">' + sampleFail + '</span>') +
-        '</td>' +
-      '</tr>';
-    }).join('');
-    tbody.innerHTML = rows;
-
-    tbody.querySelectorAll('.cnt-link').forEach(function (chip) {
-      chip.addEventListener('click', function () {
-        setTypeFilter(chip.getAttribute('data-type'));
-        document.getElementById('proc-filter').value = chip.getAttribute('data-proc');
-        document.getElementById('sev-filter').value = 'all';
-        document.getElementById('search-inp').value = '';
-        filterState.process = chip.getAttribute('data-proc');
-        filterState.severity = 'all';
-        filterState.search = '';
-        applyFilters();
-        document.querySelector('#type-chips').scrollIntoView({ block: 'start', behavior: 'smooth' });
-      });
-    });
   }
 
   // ============ TIMELINE (Plotly) ============
@@ -1560,14 +1522,10 @@ _JS = r"""
       java_crash:    'Java crash',
       native_crash:  'Native crash',
       anr:           'ANR',
-      process_death: 'Process death',
-      lc_new:        tr('进程新增 · new',     'new'),
-      lc_restart:    tr('进程重启 · restart', 'restart'),
-      lc_gone:       tr('进程消失 · gone',    'gone'),
+      other:         tr('其他', 'Other'),
       device:        tr('设备事件 · device',  'device'),
     };
-    var YORDER_BOTTOM_TO_TOP = ['lc_gone', 'lc_restart', 'lc_new', 'process_death', 'anr', 'native_crash', 'java_crash', 'device'];
-    var LC_COLORS = { new: '#15803d', restart: '#c2410c', gone: '#4b5563' };
+    var YORDER_BOTTOM_TO_TOP = ['other', 'anr', 'native_crash', 'java_crash', 'device'];
 
     function toIso(ts) { return String(ts).replace(' ', 'T'); }
 
@@ -1582,7 +1540,8 @@ _JS = r"""
     var t0ms = t0 ? new Date(t0 + 'Z').getTime() : 0;
     var t1ms = t1 ? new Date(t1 + 'Z').getTime() : 0;
     var durMs = t1ms > t0ms ? t1ms - t0ms : 3600000;
-    var estPlotWidthPx = 994; // page 1280 – page-padding 112 – plot-margins 174
+    var timelineEl = document.getElementById('timeline-plot');
+    var estPlotWidthPx = Math.max(420, ((timelineEl && timelineEl.clientWidth) || 1168) - 174);
     var msPerPx = durMs / estPlotWidthPx;
     var padMs = Math.max(30000, durMs * 0.01);
     var t0Range = t0 ? new Date(t0ms - padMs).toISOString() : null;
@@ -1590,9 +1549,8 @@ _JS = r"""
 
     // ── Numeric y-axis: each lane is an integer, lanes 0-2 = lifecycle, 3-6 = events ──
     var LANE_Y = {
-      lc_gone: 0, lc_restart: 1, lc_new: 2,
-      process_death: 3, anr: 4, native_crash: 5, java_crash: 6,
-      device: 7,
+      other: 0, anr: 1, native_crash: 2, java_crash: 3,
+      device: 4,
     };
 
     // jitterY: spread points that would visually overlap on the same lane
@@ -1622,17 +1580,20 @@ _JS = r"""
 
     // Jitter threshold = one marker diameter worth of time.
     var evtClusterMs = msPerPx * 14;
-    var lcClusterMs  = msPerPx * 10;
 
     var shapes = [];
     var annotations = [];
 
     var traces = [];
-    ['java_crash', 'native_crash', 'anr', 'process_death'].forEach(function (type) {
-      var xs = [], ids = [], text = [];
-      incidents.filter(function (i) { return i.type === type; }).forEach(function (inc) {
+    ['java_crash', 'native_crash', 'anr', 'other'].forEach(function (type) {
+      var xs = [], ids = [], targetIds = [], text = [];
+      occurrences.filter(function (i) { return i.type === type; }).forEach(function (inc) {
         xs.push(toIso(inc.triggered_at));
+        // Plotly requires `ids` to be unique for object constancy. Repeated
+        // occurrences intentionally share one representative, so keep the
+        // occurrence id in `ids` and the click target in `customdata`.
         ids.push(inc.id);
+        targetIds.push(inc.group_representative_incident_id || inc.id);
         var proc = inc.process + (inc.pid ? (' (pid=' + inc.pid + ')') : '');
         var summary = String(inc.summary || '');
         text.push('<b>' + inc.id + '</b><br>' + yLabels[type] + ' · ' + proc + '<br>' + inc.triggered_at +
@@ -1640,32 +1601,11 @@ _JS = r"""
       });
       var ys = jitterY(xs, LANE_Y[type], evtClusterMs, 0.30);
       traces.push({
-        x: xs, y: ys, ids: ids,
+        x: xs, y: ys, ids: ids, customdata: targetIds,
         mode: 'markers', type: 'scatter',
         marker: { symbol: 'x', size: 14, color: TYPE_LABELS[type].color, line: { width: 2.5, color: TYPE_LABELS[type].color } },
         text: text, hovertemplate: '%{text}<extra></extra>',
         name: yLabels[type], showlegend: false,
-        cliponaxis: false,
-      });
-    });
-
-    ['new', 'restart', 'gone'].forEach(function (ev) {
-      var xs = [], text = [];
-      lifecycle.filter(function (lc) { return lc.event === ev; }).forEach(function (lc) {
-        xs.push(toIso(lc.timestamp));
-        var info;
-        if (ev === 'restart') info = 'pid ' + lc.old_pid + ' → ' + lc.new_pid + ' · gap ' + (lc.gap_sec || 0).toFixed(1) + 's';
-        else if (ev === 'new') info = 'pid=' + lc.new_pid;
-        else info = 'pid=' + lc.old_pid;
-        text.push('<b>' + ev + '</b><br>' + lc.process + '<br>' + lc.timestamp + '<br>' + info);
-      });
-      var ys = jitterY(xs, LANE_Y['lc_' + ev], lcClusterMs, 0.25);
-      traces.push({
-        x: xs, y: ys,
-        mode: 'markers', type: 'scatter',
-        marker: { symbol: 'circle', size: 10, color: LC_COLORS[ev], line: { width: 1.5, color: '#ffffff' } },
-        text: text, hovertemplate: '%{text}<extra></extra>',
-        name: yLabels['lc_' + ev], showlegend: false,
         cliponaxis: false,
       });
     });
@@ -1688,34 +1628,60 @@ _JS = r"""
       });
     });
 
-    // Dotted separators: lifecycle (0-2) / events (3-6) / device (7)
+    // Dotted separator between issue occurrences and device events.
     shapes.push({
       type: 'line', xref: 'paper', yref: 'y',
-      x0: 0, x1: 1, y0: 2.5, y1: 2.5,
+      x0: 0, x1: 1, y0: 3.5, y1: 3.5,
       line: { color: '#d1d5db', width: 1, dash: 'dot' },
       layer: 'below',
     });
-    shapes.push({
-      type: 'line', xref: 'paper', yref: 'y',
-      x0: 0, x1: 1, y0: 6.5, y1: 6.5,
-      line: { color: '#d1d5db', width: 1, dash: 'dot' },
-      layer: 'below',
-    });
-
-    bookmarks.forEach(function (b) {
+    // Greedy interval packing puts labels whose screen-space boxes overlap on
+    // separate vertical lanes.  Labels stay attached to their exact x value,
+    // but adjacent/long bookmarks remain readable instead of covering each
+    // other.
+    var bookmarkLayout = bookmarks.map(function (b, index) {
       var ts = toIso(b.timestamp);
+      var bookmarkMs = new Date(ts + (/[zZ]|[+-]\d\d:\d\d$/.test(ts) ? '' : 'Z')).getTime();
+      var nearRight = isFinite(bookmarkMs) && durMs > 0 && (bookmarkMs - t0ms) / durMs > 0.72;
+      var ratio = isFinite(bookmarkMs)
+        ? (bookmarkMs - (t0ms - padMs)) / (durMs + 2 * padMs)
+        : 0;
+      ratio = Math.max(0, Math.min(1, ratio));
+      var xPx = ratio * estPlotWidthPx;
+      var labelWidth = Math.min(320, 34 + String(b.label || '').length * 7.2);
+      return {
+        index: index, bookmark: b, ts: ts, nearRight: nearRight,
+        left: nearRight ? xPx - labelWidth - 6 : xPx + 6,
+        right: nearRight ? xPx - 6 : xPx + labelWidth + 6,
+        lane: 0,
+      };
+    });
+    var bookmarkLaneEnds = [];
+    bookmarkLayout.slice().sort(function (a, b) { return a.left - b.left; }).forEach(function (item) {
+      var lane = 0;
+      while (lane < bookmarkLaneEnds.length && item.left <= bookmarkLaneEnds[lane] + 8) lane++;
+      item.lane = lane;
+      bookmarkLaneEnds[lane] = item.right;
+    });
+    var maxBookmarkLane = bookmarkLayout.reduce(function (maxLane, item) {
+      return Math.max(maxLane, item.lane);
+    }, 0);
+
+    bookmarkLayout.forEach(function (item) {
+      var b = item.bookmark;
       shapes.push({
         type: 'line', xref: 'x', yref: 'paper',
-        x0: ts, x1: ts, y0: 0, y1: 1,
+        x0: item.ts, x1: item.ts, y0: 0, y1: 1,
         line: { color: '#1d4ed8', width: 1.5, dash: 'dash' },
         layer: 'below',
       });
       annotations.push({
-        x: ts, xref: 'x', y: 1.04, yref: 'paper',
+        x: item.ts, xref: 'x', y: 1.04 + item.lane * 0.10, yref: 'paper',
         text: '🔖 ' + b.label,
         showarrow: false,
         font: { size: 11, color: '#1d4ed8', family: 'SF Mono, Menlo, monospace' },
-        xanchor: 'left',
+        xanchor: item.nearRight ? 'right' : 'left',
+        xshift: item.nearRight ? -6 : 6,
         bgcolor: 'rgba(255,255,255,0.95)',
         bordercolor: '#1d4ed8',
         borderwidth: 1,
@@ -1724,8 +1690,8 @@ _JS = r"""
     });
 
     var layout = {
-      margin: { l: 150, r: 24, t: 32, b: 44 },
-      height: 500,
+      margin: { l: 150, r: 24, t: 32 + maxBookmarkLane * 28, b: 44 },
+      height: 420 + maxBookmarkLane * 28,
       paper_bgcolor: '#ffffff',
       plot_bgcolor: '#ffffff',
       xaxis: {
@@ -1740,9 +1706,9 @@ _JS = r"""
       yaxis: {
         type: 'linear',
         tickmode: 'array',
-        tickvals: [0, 1, 2, 3, 4, 5, 6, 7],
+        tickvals: [0, 1, 2, 3, 4],
         ticktext: YORDER_BOTTOM_TO_TOP.map(function (k) { return yLabels[k]; }),
-        range: [-0.6, 7.6],
+        range: [-0.6, 4.6],
         gridcolor: '#f3f4f6',
         linecolor: '#9ca3af',
         tickfont: { family: '-apple-system, sans-serif', size: 13, color: '#1f2937' },
@@ -1766,7 +1732,7 @@ _JS = r"""
     Plotly.newPlot(plotEl, traces, layout, config).then(function () {
       plotEl.on('plotly_click', function (ev) {
         if (!ev.points || ev.points.length === 0) return;
-        var id = ev.points[0].id;
+        var id = ev.points[0].customdata || ev.points[0].id;
         if (id) jumpToIncident(id);
       });
     });
@@ -1824,21 +1790,13 @@ _JS = r"""
       var sev = SEV_LABELS[inc.severity] || { zh: inc.severity, en: inc.severity, cls: 'gray' };
       var chipCls = TYPE_CLS[inc.type] || 'gray';
       var summary = String(inc.summary || '');
-      // Decode numeric process_death reason codes embedded in the summary string.
-      if (inc.type === 'process_death') {
-        var ev0 = inc.evidence || {};
-        if (ev0.reason != null) {
-          var raw0 = String(ev0.reason);
-          var decoded0 = decodeReason(raw0);
-          if (decoded0 !== raw0) summary = summary.split(raw0).join(decoded0);
-        }
-      }
       if (summary.length > 110) summary = summary.slice(0, 110) + '…';
       return '<div class="inc-item type-' + inc.type + (inc.id === filterState.selectedId ? ' active' : '') + '" data-id="' + escapeAttr(inc.id) + '">' +
         '<div class="row1">' +
           '<span class="chip ' + chipCls + '">' + escapeHtml(t.zh) + '</span>' +
           '<span class="chip ' + sev.cls + '">' + escapeHtml(sev.zh) + '</span>' +
-          '<span class="id">' + escapeHtml(inc.id) + '</span>' +
+          '<span class="id">' + escapeHtml(inc.issue_id || inc.id) + '</span>' +
+          '<span class="chip blue"><span class="zh">发生 ' + Number(inc.occurrence_count || 1) + ' 次</span><span class="en">' + Number(inc.occurrence_count || 1) + ' occurrences</span></span>' +
         '</div>' +
         '<div class="row2">' + fmtTime(inc.triggered_at) + ' · ' + escapeHtml(inc.process) + (inc.pid ? ' · pid=' + inc.pid : '') + '</div>' +
         '<div class="row3">' + escapeHtml(summary) + '</div>' +
@@ -1900,7 +1858,11 @@ _JS = r"""
     var sev = SEV_LABELS[inc.severity] || { zh: inc.severity, en: inc.severity, cls: 'gray' };
     var chipCls = TYPE_CLS[inc.type] || 'gray';
     var ev = inc.evidence || {};
-    var top = ev.top_frames || [];
+    var top = ev.deobfuscated_frames;
+    if (!top || !top.length) top = ev.symbolized_frames;
+    if (!top || !top.length) top = ev.top_frames;
+    if ((!top || !top.length) && ev.diagnosis) top = ev.diagnosis.supporting_frames;
+    if (!top) top = [];
 
     var pkgPrefix = run.package || '';
     var emptyFrameMsg;
@@ -1923,20 +1885,28 @@ _JS = r"""
         'ANR 调用栈记录在 trace 文件中（如有）。',
         'ANR stack is in the trace file (if available).'
       );
-    } else {
-      emptyFrameMsg = tr('进程退出事件无调用栈。', 'Process death events have no stack frames.');
     }
     var framesHtml = top.length === 0
       ? '<div class="f-empty">' + emptyFrameMsg + '</div>'
       : top.map(function (line, i) {
           var isBiz = pkgPrefix && String(line).indexOf(pkgPrefix) >= 0;
-          return '<div class="f-line' + (isBiz ? ' biz' : '') + '" data-line="' + escapeAttr(line) + '">' +
+          return '<div class="f-line' + (isBiz ? ' biz' : '') + '" data-line="' + escapeAttr(line) + '" role="button" tabindex="0"' +
+            ' title="' + escapeAttr(tr('点击复制此栈帧', 'Click to copy this stack frame')) + '">' +
             '<span class="idx">#' + String(i).padStart(2, '0') + '</span><span>' + escapeHtml(line) + '</span></div>';
         }).join('');
+    var frameCopyHint = top.length
+      ? '<span class="c"><span class="zh">点击下方任一栈帧即可复制；黄色行为业务包栈帧</span>' +
+        '<span class="en">Click any frame below to copy; yellow marks business-package frames</span>' +
+        '<span class="copy-state" aria-live="polite"></span></span>'
+      : '<span class="c"><span class="zh">暂无可复制栈帧</span><span class="en">No stack frame available to copy</span></span>';
 
-    function statBox(k_zh, k_en, v, cls) {
+    function statBox(k_zh, k_en, v, cls, options) {
       cls = cls || '';
-      return '<div class="stat"><div class="k"><span class="zh">' + k_zh + '</span><span class="en">' + k_en + '</span></div>' +
+      options = options || {};
+      var help = options.helpZh
+        ? helpTipMarkup(options.helpZh, options.helpEn || options.helpZh, options.helpAria || k_zh)
+        : '';
+      return '<div class="stat' + (options.wide ? ' wide' : '') + '"><div class="k"><span class="zh">' + k_zh + '</span><span class="en">' + k_en + '</span>' + help + '</div>' +
              '<div class="v ' + cls + '">' + (v != null && v !== '' ? escapeHtml(String(v)) : '—') + '</div></div>';
     }
     // SOURCE_LABELS: logcat = 实时流，dropbox = 兜底轮询，watcher = 进程监控
@@ -1962,29 +1932,43 @@ _JS = r"""
                    (ev.exit_info_description ? statBox('ExitInfo 描述', 'ExitInfo description', ev.exit_info_description) : '') +
                    (ev.exit_info_rss_kb != null ? statBox('ExitInfo RSS', 'ExitInfo RSS', ev.exit_info_rss_kb + ' KB') : '') +
                    (ev.supporting_sources ? statBox('交叉证据源', 'Supporting sources', ev.supporting_sources.join(', ')) : '') +
-                   (ev.termination_incident_id ? statBox('关联进程退出', 'Related termination', ev.termination_incident_id + ' (+' + (ev.termination_delay_sec || 0) + 's)') : '') +
-                   (ev.fallback_reason ? statBox('降级原因', 'Fallback reason', ev.fallback_reason) : '');
+                   (ev.fallback_reason ? statBox('降级原因', 'Fallback reason', ev.fallback_reason, '', { wide: true }) : '');
     } else if (inc.type === 'native_crash') {
       typeFields = statBox('信号', 'Signal', ev.signal || '—', 'red') +
                    statBox('fault addr', 'Fault addr', ev.fault_addr || '—') +
                    sourceBox(ev.source) +
                    statBox('设备时间戳', 'Device ts', ev.device_ts || '—') +
-                   (ev.fallback_reason ? statBox('降级原因', 'Fallback reason', ev.fallback_reason) : '');
+                   (ev.fallback_reason ? statBox('降级原因', 'Fallback reason', ev.fallback_reason, '', { wide: true }) : '');
     } else if (inc.type === 'anr') {
       typeFields =
         '<div class="stat" style="grid-column: span 2;"><div class="k"><span class="zh">原因</span><span class="en">Reason</span></div>' +
         '<div class="v orange" style="font-size: var(--fs-sm); font-weight: 600;">' + escapeHtml(ev.reason || '—') + '</div></div>' +
         sourceBox(ev.source) +
         statBox('设备时间戳', 'Device ts', ev.device_ts || '—') +
-        (ev.fallback_reason ? statBox('降级原因', 'Fallback reason', ev.fallback_reason) : '');
-    } else {
-      typeFields = statBox('原因', 'Reason', decodeReason(ev.reason)) +
-                   sourceBox(ev.source) +
-                   statBox('设备时间戳', 'Device ts', ev.device_ts || '—') +
-                   (ev.secondary_to_incident_id
-                     ? statBox('归属根问题', 'Root problem', ev.secondary_to_incident_id + ' (' + (ev.root_cause_type || 'crash') + ')')
-                     : statBox('计数口径', 'Counting', tr('独立根问题', 'independent root problem')));
+        (ev.fallback_reason ? statBox('降级原因', 'Fallback reason', ev.fallback_reason, '', { wide: true }) : '');
+    } else if (inc.type === 'other') {
+      typeFields =
+        statBox('问题类别', 'Issue category', ev.original_type || 'unknown') +
+        sourceBox(ev.source) +
+        statBox('设备时间戳', 'Device ts', ev.device_ts || '—') +
+        (ev.fallback_reason ? statBox('降级原因', 'Fallback reason', ev.fallback_reason, '', { wide: true }) : '');
     }
+    typeFields =
+      statBox('发生次数', 'Occurrences', Number(inc.occurrence_count || 1), Number(inc.occurrence_count || 1) > 1 ? 'red' : '') +
+      statBox('首次发生', 'First seen', fmtTime(inc.first_seen_at || inc.triggered_at || '—')) +
+      statBox('末次发生', 'Last seen', fmtTime(inc.last_seen_at || inc.triggered_at || '—')) +
+      statBox(
+        '聚类置信度',
+        'Cluster confidence',
+        inc.grouping_confidence != null ? inc.grouping_confidence : '—',
+        '',
+        {
+          helpZh: '0 到 1，表示组内最不相似的两次发生的匹配分数；越接近 1，属于同一根因的把握越高。单次发生或完全一致的指纹为 1。',
+          helpEn: 'A 0–1 score equal to the least-similar pair in the group. Closer to 1 means stronger confidence in one root cause. A single occurrence or identical fingerprints score 1.',
+          helpAria: '解释聚类置信度'
+        }
+      ) +
+      typeFields;
 
     var filesParts = [];
     if (ev.logcat_slice_file) {
@@ -2024,7 +2008,7 @@ _JS = r"""
 
     root.innerHTML =
       '<div class="hd">' +
-        '<h3>' + escapeHtml(inc.id) + '</h3>' +
+        '<h3>' + escapeHtml(inc.issue_id || inc.id) + '</h3>' +
         '<span class="chip ' + chipCls + '">' + escapeHtml(t.zh) + '</span>' +
         '<span class="chip ' + sev.cls + '">' + escapeHtml(sev.zh) + '</span>' +
         '<span class="meta">' + escapeHtml(inc.process) + (inc.pid ? ' · pid=' + inc.pid : '') + ' · ' + escapeHtml(inc.triggered_at || '') + '</span>' +
@@ -2034,7 +2018,7 @@ _JS = r"""
       '<div class="sub-title"><span class="t"><span class="zh">摘要 Summary</span><span class="en">Summary</span></span></div>' +
       '<div class="summary-box ' + inc.type + '">' + escapeHtml(inc.summary || '') + '</div>' +
       '<div class="sub-title"><span class="t"><span class="zh">Top 栈帧</span><span class="en">Top stack frames</span></span>' +
-        '<span class="c">' + tr('点击行复制 · 业务包名高亮', 'click line to copy · business package highlighted') + '</span>' +
+        frameCopyHint +
       '</div>' +
       '<div class="frames">' + framesHtml + '</div>' +
       '<div class="sub-title" style="margin-top: 24px;">' +
@@ -2044,9 +2028,24 @@ _JS = r"""
 
     root.querySelectorAll('.f-line[data-line]').forEach(function (line) {
       line.addEventListener('click', async function () {
-        try { await navigator.clipboard.writeText(line.getAttribute('data-line')); } catch (e) {}
-        line.classList.add('copied');
-        setTimeout(function () { line.classList.remove('copied'); }, 700);
+        var ok = await copyText(line.getAttribute('data-line'));
+        var state = root.querySelector('.copy-state');
+        line.classList.toggle('copied', ok);
+        line.classList.toggle('copy-failed', !ok);
+        if (state) {
+          state.textContent = ok ? tr('✓ 已复制', '✓ Copied') : tr('复制失败，请手动选择', 'Copy failed; select manually');
+          state.className = 'copy-state ' + (ok ? 'ok' : 'fail');
+        }
+        setTimeout(function () {
+          line.classList.remove('copied', 'copy-failed');
+          if (state) { state.textContent = ''; state.className = 'copy-state'; }
+        }, 1400);
+      });
+      line.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          line.click();
+        }
       });
     });
   }
@@ -2140,7 +2139,6 @@ _JS = r"""
       b.addEventListener('click', function () {
         root.setAttribute('data-lang', b.getAttribute('data-lang-btn'));
         paint();
-        renderProcessTable();
         applyFilters();
         if (window.Plotly) renderTimeline();
         renderFilesTree();
@@ -2155,7 +2153,8 @@ _JS = r"""
     var btn = document.getElementById('copy-pkg');
     if (!btn) return;
     btn.addEventListener('click', async function () {
-      try { await navigator.clipboard.writeText(run.package || ''); } catch (e) {}
+      var ok = await copyText(run.package || '');
+      if (!ok) return;
       btn.classList.add('ok');
       btn.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3.5,8.5 6.5,11.5 12.5,5"/></svg>';
       setTimeout(function () {
@@ -2197,17 +2196,7 @@ _JS = r"""
     var grid = document.getElementById('cfg-grid');
     var groups = [
       { title_zh: '基本', title_en: 'Basics',
-        keys: ['package', 'device', 'output_dir', 'profile_name', 'wait_timeout_sec', 'rescan_interval_sec', 'process_filter'] },
-      { title_zh: '采集', title_en: 'Collection',
-        keys: ['logcat_enabled', 'logcat_buffers', 'logcat_reconnect_backoff_sec', 'device_health_interval_sec', 'device_reboot_policy', 'resource_risk_enabled', 'resource_risk_interval_sec', 'self_monitor_enabled', 'self_monitor_interval_sec'] },
-      { title_zh: '检测开关', title_en: 'Detectors',
-        keys: ['enable_java_crash', 'enable_native_crash', 'enable_anr', 'enable_process_death', 'dedup_window_sec'] },
-      { title_zh: '证据', title_en: 'Evidence',
-        keys: ['pre_context_sec', 'post_context_sec', 'max_incidents_per_type', 'max_concurrent_dumps', 'pull_tombstone', 'pull_anr_trace', 'mapping_file', 'native_symbols_dir'] },
-      { title_zh: '策略', title_en: 'Policy',
-        keys: ['ci_mode', 'policy_fail_on', 'policy_max_process_death', 'policy_max_anr', 'policy_max_restarts', 'policy_min_uptime_ratio'] },
-      { title_zh: '输出与集成', title_en: 'Output & integration',
-        keys: ['emit_html', 'status_interval_sec', 'dashboard', 'plugins_enabled', 'redact', 'webhook_url', 'replay_of_run_id'] },
+        keys: ['package', 'device', 'output_dir'] },
     ];
     var presented = {};
     function fmtVal(v) {
@@ -2230,25 +2219,14 @@ _JS = r"""
         rows + '</div>';
     }).filter(Boolean);
 
-    // catch-all for any unknown keys
-    var extras = Object.keys(configEff).filter(function (k) { return !presented[k]; }).sort();
-    if (extras.length > 0) {
-      var rows = extras.map(function (k) {
-        return '<div class="kv"><span class="k">' + escapeHtml(k) + '</span>' + fmtVal(configEff[k]) + '</div>';
-      }).join('');
-      sections.push('<div class="cfg-group">' +
-        '<div class="g-title"><span class="zh">其他</span><span class="en">Other</span></div>' +
-        rows + '</div>');
-    }
     grid.innerHTML = sections.join('');
     if (sections.length === 0) {
       grid.innerHTML = '<div class="v-muted">' + tr('无非默认配置。', 'No non-default configuration.') + '</div>';
     }
     var shown = Object.keys(configEff).length;
-    var hidden = configMeta.hidden_count || 0;
     document.getElementById('cfg-count').innerHTML =
-      '<span class="zh">显示 ' + shown + ' 项 · 隐藏 ' + hidden + ' 项默认配置</span>' +
-      '<span class="en">' + shown + ' shown · ' + hidden + ' defaults hidden</span>';
+      '<span class="zh">' + shown + ' 项</span>' +
+      '<span class="en">' + shown + ' items</span>';
   }
 
   // ============ FILES TREE ============
@@ -2398,10 +2376,10 @@ _JS = r"""
     renderDerivedStrip();
     renderTypeChipCounts();
     renderProcessSelect();
-    renderProcessTable();
     renderBookmarks();
     renderConfigGrid();
     renderFilesTree();
+    initHelpTips();
     initHeroCards();
     initFilters();
 
@@ -2432,13 +2410,86 @@ _JS = r"""
 def render(result: Dict) -> str:
     """Render the full HTML report from a `report.json` result dict."""
     run = result.get("run", {}) or {}
-    config_eff = run.get("config_effective", {}) or {}
+    config_eff = dict(run.get("config_effective", {}) or {})
     pkg = run.get("package", "")
+
+    raw_incidents = []
+    for source in result.get("incidents", []) or []:
+        original_type = source.get("type")
+        if original_type == "process_death":
+            continue
+        incident = dict(source)
+        evidence = dict(source.get("evidence") or {})
+        if original_type not in ISSUE_EVENT_TYPES:
+            incident["type"] = "other"
+            evidence["original_type"] = original_type or "unknown"
+        if (
+            evidence.get("source") == "exit_info"
+            and incident.get("type") != "anr"
+            and not (evidence.get("exception_class") or evidence.get("signal") or evidence.get("top_frames"))
+        ):
+            continue
+        incident["evidence"] = evidence
+        incident["evidence"].pop("termination_incident_id", None)
+        incident["evidence"].pop("termination_event_id", None)
+        incident["evidence"].pop("termination_delay_sec", None)
+        raw_incidents.append(incident)
+
+    groups = group_incidents(raw_incidents)
+    by_id = {incident.get("id"): incident for incident in raw_incidents}
+    display_incidents = []
+    representative_by_occurrence = {}
+    for index, group in enumerate(groups, start=1):
+        representative_id = group.get("representative_incident_id")
+        representative = by_id.get(representative_id)
+        if representative is None:
+            continue
+        display = dict(representative)
+        display["evidence"] = dict(representative.get("evidence") or {})
+        display.update(
+            {
+                "issue_id": f"issue-{index:03d}",
+                "occurrence_count": group.get("occurrence_count", 1),
+                "occurrence_ids": group.get("occurrence_ids", []),
+                "first_seen_at": group.get("first_seen_at"),
+                "last_seen_at": group.get("last_seen_at"),
+                "fingerprint": group.get("fingerprint"),
+                "fingerprint_version": group.get("fingerprint_version"),
+                "grouping_method": group.get("grouping_method"),
+                "grouping_confidence": group.get("grouping_confidence"),
+            }
+        )
+        display_incidents.append(display)
+        for occurrence_id in group.get("occurrence_ids", []):
+            representative_by_occurrence[occurrence_id] = representative_id
+
+    occurrences_block = []
+    for incident in raw_incidents:
+        occurrence = dict(incident)
+        occurrence["group_representative_incident_id"] = representative_by_occurrence.get(
+            incident.get("id"), incident.get("id")
+        )
+        occurrences_block.append(occurrence)
+
+    by_type = {event_type: 0 for event_type in ISSUE_EVENT_TYPES}
+    for group in groups:
+        by_type[group.get("type")] += int(group.get("occurrence_count", 0))
+    html_incident_summary = {
+        "record_count": sum(by_type.values()),
+        "root_problem_count": len(groups),
+        "correlated_termination_count": 0,
+        "by_type": by_type,
+    }
+
+    device = run.get("device") or {}
+    config_eff["package"] = config_eff.get("package") or pkg or "—"
+    config_eff["device"] = config_eff.get("device") or device.get("serial") or "—"
+    config_eff["output_dir"] = config_eff.get("output_dir") or "—"
 
     # Build the embedded JSON blocks. We split incidents/lifecycle from `report`
     # so each block is small and the JS reads them independently.
     report_block = {
-        "schema_version": result.get("schema_version", "1.15"),
+        "schema_version": result.get("schema_version", "1.17"),
         "run": {
             "package": pkg,
             "started_at": run.get("started_at"),
@@ -2448,17 +2499,17 @@ def render(result: Dict) -> str:
             "exit_reason": run.get("exit_reason"),
             "device": run.get("device") or {},
         },
-        "processes": result.get("processes", []) or [],
         "bookmarks": result.get("bookmarks", []) or [],
-        "incident_summary": result.get("incident_summary", {}) or {},
+        "incident_summary": html_incident_summary,
         "collection_health": result.get("collection_health", "unknown"),
+        "collection_health_reasons": result.get("collection_health_reasons", []) or [],
         "coverage_ratio": result.get("coverage_ratio"),
+        "coverage_threshold": float(config_eff.get("min_coverage_ratio", 0.99) or 0.99),
+        "collectors": result.get("collectors", {}) or {},
     }
-    incidents_block = result.get("incidents", []) or []
-    issue_groups_block = result.get("issue_groups", []) or []
     device_events_block = result.get("device_events", []) or []
-    lifecycle_block = result.get("lifecycle_events", []) or []
     files_block = result.get("data_files", {}) or {"events": [], "lifecycle": [], "logcat": []}
+    files_block = {**files_block, "lifecycle": []}
     config_block = _compact_config(config_eff)
 
     parts = [
@@ -2476,21 +2527,18 @@ def render(result: Dict) -> str:
         "</style>",
         "</head>",
         "<body>",
-        _BODY_SKELETON.replace(
-            "<!-- ISSUE_GROUPS -->",
-            _render_issue_groups(issue_groups_block),
-        ),
+        _BODY_SKELETON,
         '<script type="application/json" id="report-data">',
         _safe_json(report_block),
         "</script>",
         '<script type="application/json" id="incidents-data">',
-        _safe_json(incidents_block),
+        _safe_json(display_incidents),
+        "</script>",
+        '<script type="application/json" id="occurrences-data">',
+        _safe_json(occurrences_block),
         "</script>",
         '<script type="application/json" id="device-events-data">',
         _safe_json(device_events_block),
-        "</script>",
-        '<script type="application/json" id="lifecycle-data">',
-        _safe_json(lifecycle_block),
         "</script>",
         '<script type="application/json" id="files-data">',
         _safe_json(files_block),

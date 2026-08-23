@@ -90,7 +90,7 @@ class DetectionConfig:
     enable_java_crash: bool = True
     enable_native_crash: bool = True
     enable_anr: bool = True
-    enable_process_death: bool = True
+    enable_process_death: bool = False
     # Host-time fallback window: used when device_ts is absent.
     dedup_window_sec: float = 5.0
     # Device-time window: dedup events from the same physical crash that arrive
@@ -243,6 +243,12 @@ class CollectorPool:
         self._logcat_thread: Optional[threading.Thread] = None
         self._watcher_thread: Optional[threading.Thread] = None
         self._logcat_stream: Optional[LogcatStream] = None
+        # Startup barrier: a run is not observable until the logcat process
+        # has produced its first line.  The factory event is set only after
+        # the initial device timestamp watermark has been captured, allowing
+        # wait_for_logcat_ready() to emit a deterministic probe line safely.
+        self._logcat_factory_ready = threading.Event()
+        self._logcat_first_line_ready = threading.Event()
         self._logcat_stats: Dict = {}
         self._parser: Optional[LogcatLineParser] = None
         self._exit_watermark: Optional[float] = None
@@ -400,6 +406,36 @@ class CollectorPool:
         )
         self._watcher_thread.start()
 
+    def wait_for_logcat_ready(self, timeout_sec: float) -> bool:
+        """Wait until the initial logcat stream has yielded a real line.
+
+        A probe written through Android's ``log`` command prevents an idle
+        device from making startup depend on unrelated system activity.  The
+        probe is emitted after the stream's initial watermark is captured, so
+        it is guaranteed to be inside the subscribed range.
+        """
+        if not self._collectors_cfg.logcat_enabled:
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        remaining = max(0.0, deadline - time.monotonic())
+        if not self._logcat_factory_ready.wait(remaining):
+            return False
+        if self._logcat_first_line_ready.is_set():
+            return True
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            return False
+        try:
+            self._adb.shell(
+                "log -t stability_auto_test collector-ready-probe",
+                check=False,
+                timeout=min(5.0, remaining),
+            )
+        except Exception:
+            log.exception("failed to emit logcat readiness probe")
+        remaining = max(0.0, deadline - time.monotonic())
+        return self._logcat_first_line_ready.wait(remaining)
+
     def stop(
         self,
         join_timeout: float = 5.0,
@@ -554,8 +590,10 @@ class CollectorPool:
         out: Dict = {}
         if self._logcat_stream is not None:
             self._logcat_stats = dict(self._logcat_stream.stats)
-        if self._logcat_stats:
-            out["logcat"] = dict(self._logcat_stats)
+        if self._collectors_cfg.logcat_enabled:
+            logcat_status = dict(self._logcat_stats)
+            logcat_status["ready"] = self._logcat_first_line_ready.is_set()
+            out["logcat"] = logcat_status
         return out
 
     def queue_backlog_peak(self) -> int:
@@ -757,11 +795,14 @@ class CollectorPool:
             self._logcat_stream = self._logcat_stream_factory()
         except Exception:
             log.exception("logcat stream factory failed; logcat pipeline disabled")
+            self._logcat_factory_ready.set()
             return
+        self._logcat_factory_ready.set()
         try:
             for line in self._logcat_stream.lines():
                 if self._global_stop.is_set():
                     break
+                self._logcat_first_line_ready.set()
                 self._append_context_entry(line)
                 self._record_fault_marker(line)
                 if self._logcat_writer is not None:
@@ -1770,6 +1811,10 @@ class CollectorPool:
                 trace_lines,
                 reason=evidence.get("reason"),
             )
+            if not evidence.get("top_frames"):
+                evidence["top_frames"] = list(
+                    evidence["diagnosis"].get("supporting_frames") or []
+                )
 
         if self._quota.hard_reached and event.event_type != EVENT_PROCESS_DEATH:
             evidence["disk_quota_skipped"] = True

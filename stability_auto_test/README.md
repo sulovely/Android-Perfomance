@@ -118,7 +118,7 @@ buffers、DropBox、tombstone/ANR 权限、输出目录与磁盘、符号化工�
 
 默认保持“仅采集”：发现 Crash 仍返回 0（报告 verdict=unstable）。加 `--ci`
 后，策略失败返回 1，观测不完整返回 4。策略可用 `policy:` YAML 或 CLI
-（`--fail-on` / `--max-anr` / `--max-restarts` / `--min-coverage`）覆盖：
+（`--fail-on` / `--max-anr` / `--min-coverage`）覆盖：
 
 ```bash
 python -m sat --package com.example.app --duration 30s --ci \
